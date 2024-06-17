@@ -1,0 +1,47 @@
+This is BibTeX, Version 0.99c (TeX Live 2009/Debian)
+The top-level auxiliary file: isea.aux
+The style file: isea.bst
+Database file #1: isea.bib
+Warning--empty year in UCI
+You've used 8 entries,
+            2568 wiz_defined-function locations,
+            630 strings with 5783 characters,
+and the built_in function-call counts, 3079 in all, are:
+= -- 330
+> -- 91
+< -- 3
++ -- 30
+- -- 27
+* -- 219
+:= -- 500
+add.period$ -- 45
+call.type$ -- 8
+change.case$ -- 42
+chr.to.int$ -- 8
+cite$ -- 9
+duplicate$ -- 132
+empty$ -- 243
+format.name$ -- 39
+if$ -- 653
+int.to.chr$ -- 1
+int.to.str$ -- 0
+missing$ -- 7
+newline$ -- 53
+num.names$ -- 27
+pop$ -- 45
+preamble$ -- 1
+purify$ -- 52
+quote$ -- 0
+skip$ -- 103
+stack$ -- 0
+substring$ -- 163
+swap$ -- 36
+text.length$ -- 3
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 56
+warning$ -- 1
+while$ -- 25
+width$ -- 11
+write$ -- 116
+(There was 1 warning)
