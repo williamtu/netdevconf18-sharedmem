@@ -9,10 +9,15 @@
 \usepackage{courier}
 \usepackage[numbers]{natbib}
 \pdfinfo{
-/Title (ISEA2015 Formatting Instructions for Authors)
-/Author (ISEA 2015)}
+/Title (Shared Memory Pool for Representors)
+/Author (Netdev Conference 0x18, 2024)}
 % The file isea.sty is the style file for ISEA 2015 proceedings.
-%
+% reference: epoll paper: Busy Polling: Past, Present, Future
+% https://netdevconf.info/2.1/papers/BusyPollingNextGen.pdf
+% reference: ./Documentation/networking/representors.rst
+% old slides about eswitch
+% https://www.netdevconf.info/1.2/slides/oct6/04_gerlitz_efraim_introduction_to_switchdev_sriov_offloads.pdf
+
 \title{Shared Memory Pool for Representors}
 \author{William Tu, Michal Swiatkowski, and Yossi Kuperman\\
 Nvidia and Intel\\
@@ -22,22 +27,41 @@ witu@nvidia.com, michal.swiatkowski@intel.com, yossiku@nvidia.com\\
 }
 \setcounter{secnumdepth}{0}
 
+% due deligent https://lore.kernel.org/netdev/39dbf7f6-76e0-4319-97d8-24b54e788435@nvidia.com/
+%
 \begin{document} 
 \maketitle
 \begin{abstract}
-When Linux network device 
-
 
 \end{abstract}
 
-\section{Keywords}
-
-The title ``Keywords'' should be 10 point, bold type, centered at the beginning of the left column. Using 9 point, justified, regular type, write up to ten keywords that highlight the main areas of your essay’s content. 
-
 \section{Introduction}
-In switchdev mode, representors are slow-path ports that handle the
-miss traffic, i.e., traffic not being forwarded by the hardware.
-Representor ports are regular ethernet devices, with multiple channels
+Modern network devices support advanced switching and offloading
+capabilities, called switchdev mode.
+In switchdev mode, users can create multiple virutal ports, vports,
+through sysfs and depending on their use cases, assigned to virtual
+machine or containers, or use it as another network device.
+Today, virtual ports in switchdev includes PF (primary functions of
+a PCIe device, providing full access to the device's capabilities.
+PFs can manage multiple VFs and SFs and are responsible for the
+overall control and configuration of the device.),
+VF (VFs are a type of PCIe function that allows for the partitioning
+of a physical network device into multiple virtual devices. ), and SF
+SFs, subfunction or scalable function, are portions of a PCI device
+that share resources with physical function.
+
+In switchdev mode, a special netdev called representors are created to
+provides the slow path for traffic which does not hit any offloaded
+fast-path rules in the virtual switch.
+
+representor also 
+configure the network connection the representee sees, e.g.
+ link up/down, MTU, e
+In typical use case, representor and representee are 1:1, e.g,
+
+%are slow-path ports that handle the
+%miss traffic, i.e., traffic not being forwarded by the hardware.
+As Representor ports are regular Ethernet devices, with multiple channels
 consuming DMA memory. Memory consumption of the representor
 port's rx buffers can grow to several GB when scaling to 1k VFs reps.
 For example, in mlx5 driver, each RQ, with a typical 1K descriptors,
@@ -45,8 +69,101 @@ consumes 3MB of DMA memory for packet buffer in descriptors, and with
 four channels, it consumes 4 * 3MB * 1024 = 12GB of memory. Since rep
 ports are for slow path traffic, most of these rep ports' rx DMA memory
 is idle when flows are forwarded directly in hardware to VFs.
+In the recent case of smartnic or DPU (data processing unit) such as
+Nvidia BlueField and Intel IPU, only the VFs and SFs and a light-weight PF
+is exposed to the host side, the PF and representors are created in the
+embedded CPU of the smartNIC.
+The SmartNIC usually has less memory resources, Nvidia BlueField 3 has
+32GB and Intel IPU has NGB, which makes the memory resource more precious.
 
-A network device driver consists of several channels and each channel
+In this talk we address the memory utilization challenges in DPU, by
+first going through all existing solutions in different vendor drivers,
+intel, nvidia, broadcom, netronme, and sfc. And we present the shared
+memory pool design and implementation.
+We should that by sharing the memory 
+
+\section{Background}
+%challenges and takeaways
+\begin{figure}[h]
+\includegraphics[width=3.31in]{figure.png}
+\caption{This is an example of figure caption. Note that all figures, and tables are to be referenced in the text. \copyright Respect Copyright.}
+\end{figure}
+
+\subsection{Eswitch and Switchdev Mode}
+An eSwitch, or embedded switch, is a hardware component within modern network
+controllers, such as the Intel® Ethernet Controller E810. It is also known as
+a Virtual Ethernet Bridge (VEB). The eSwitch is managed by the Physical Function (PF)
+driver of the Ethernet or in the case of SmartNIC, managed by the ECPF (Embedded CPU
+s PF) that runs in the smartNIC's core. Eswitch can operate in two modes:
+Legacy mode and Switchdev mode. 
+
+Legacy mode operates based on traditional MAC/VLAN steering rules. Switching
+decisions are made based on MAC addresses, VLANs, etc. There is limited ability
+to offload switching rules to hardware.
+On the other hand, switchdev mode allows for more advanced offloading
+capabilities of the E-Switch to hardware. In switchdev mode, more switching
+rules and logic can be offloaded to the hardware switch ASIC. It enables
+representor netdevices that represent the slow path of virtual functions (VFs)
+or scalable-functions (SFs) of the device. See more information about
+% $$:`Documentation/networking/switchdev.rst <switchdev>` and
+%:ref:`Documentation/networking/representors.rst <representors>`.
+% devlink dev eswitch show
+% devlink dev eswitch set mode switchdev
+% need to disable OVS hwoffload
+% so it's the iperf TX traffic on VF port that's going to overflow the PF's rxq
+
+\subsection{representors}
+
+A representor has three main roles.
+1. It is used to configure the network connection the representee sees, e.g.
+   link up/down, MTU, etc.  For instance, bringing the representor
+administratively UP should cause the representee to see a link up / carrier
+   on event.
+
+2. It provides the slow path for traffic which does not hit any offloaded
+   fast-path rules in the virtual switch.  Packets transmitted on the
+   representor netdevice should be delivered to the representee; packets
+  transmitted by the representee which fail to match any switching rule should
+  be received on the representor netdevice.  (That is, there is a virtual pipe 
+  connecting the representor to the representee, similar in concept to a veth
+  pair.)
+  This allows software switch implementations (such as OpenVSwitch or a Linux
+   bridge) to forward packets between representees and the rest of the network.
+   
+ 3. It acts as a handle by which switching rules (such as TC filters) can refer
+ to the representee, allowing these rules to be offloaded.
+
+ 
+ The combination of 2) and 3) means that the behaviour (apart from performance)
+ should be the same whether a TC filter is offloaded or not.  E.g. a TC rule
+ on a VF representor applies in software to packets received on that representor
+ netdevice, while in hardware offload it would apply to packets transmitted by
+  the representee VF.  Conversely, a mirred egress redirect to a VF representor
+  corresponds in hardware to delivery directly to the representee VF.
+ 
+When the system boots, and before any offload is configured, all packets from
+the virtual functions appear in the networking stack of the PF via the
+representors.  The PF can thus always communicate freely with the virtual functions.
+
+The PF can configure standard Linux forwarding between representors, the uplink
+or any other netdev (routing, bridging, TC classifiers).
+
+Thus, a representor is both a control plane object (representing the function in
+administrative commands) and a data plane object (one end of a virtual pipe).
+
+As a virtual link endpoint, the representor can be configured like any other
+netdevice; in some cases (e.g. link state) the representee will follow the
+representor's configuration, while in others there are separate APIs to
+configure the representee.
+ 
+A "representee" is the object that a representor represents.  So for example in
+the case of a VF representor, the representee is the corresponding VF.
+
+In addition, the devlink E-Switch also comes with other attributes listed
+in the following section.
+
+\subsection{Representor queues and its depth}
+A network device driver consists of several channels and each channel/queue
 represents an NAPI context and a set of queues that trigger that IRQ.
 devlink-sd considers only the *regular* RX queue in each channel,
 e.g., mlx5's non-regular RQs such as XSK RQ and drop RQ are not applicable
@@ -69,18 +186,30 @@ descriptors in the descriptor pool can be used by all the RQs. This
 makes the descriptor memory usage more efficient.
 
 
-Your essay’s heading should be 12 point, bold style, centered. Your body text should be 10 point, justified, single space. The first sentence after the heading begins without a paragraph indent like this paragraph.
+% explain eswitch, virtual port vport, representors, and port
+% eswitch has vport
+% vport nic 
+As software-defined network and standards such as OpenFlow or tc-flower
+requires more and more performance, network card vendors started to offer
+complex virtualization capabilities than the legacy layer 2 mac/vlan switch
+SR-IOV features, this leads to many new features and design in hardware offload
+and device abstraction in Linux kernel.
+This section talks about switchdev mode, the mode that enables
+modern advanced hardware offloading capabilities as a hardware switch device,
+and its data plance port function, vport or virtual port, and the vport's
+control plane object, called representors.
 
-The second, and subsequent paragraphs are indented 10 points. Do  not  leave  double-space  between   words  or  paragraphs. This sample shows a 10-point Times New Roman text. Times New  Roman  is  the font to be used throughout the essay.
+\section{Design}
+table here shows existing driver's implementation
 
-The ISEA2015 submission must be PDF (Portable Document Format) files formatted for 8-1/2'' x 11'' paper.
+\subsection{Nvidia mlx5 driver}
+\subsection{Intel ice driver}
+\subsection{Devlink Interface}
 
-\subsection{Word Processing Software}
-
-As detailed below, ISEA has prepared and made available a Microsoft Word template and an Open Office template for use in formatting your paper. If you are using some other word processing software, please follow the format instructions given below and ensure that your final paper looks as much like this sample as possible.
+\section{Challenges}
+\section{Thanks}
 
 \subsection{Length of Papers}
-
 A variety of paper lengths will be accepted under different categories. Please note that submission lengths must be all inclusive (including references, biographies and acknowledgements).
 \begin{itemize}
 \item Long paper submissions can be up to 8 pages in the ISEA2015 template format.
