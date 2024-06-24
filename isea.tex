@@ -71,7 +71,7 @@ responsible for the control and configuration of the device.
 The switchdev design follows the split model: a fast-path and slow-path.
 A NIC with advanced offload capability and flow table rules is
 the fast-path, while a corresponding software switch that handles
-initial flow rule setup, or the miss traffic, is considered the
+initial flow rule setup, or the miss traffic processing, is considered the
 slow-path. Different vendors such as Nvidia Connect-X or Intel ICE
 supports different offload capabilities, but they follow similar
 software slow-path design, with OVS or Linux bridge attached with
@@ -80,12 +80,11 @@ ARM cores.
 
 The slow-path ports that handles miss traffic is called representor
 netdevs, registerd as a regular Linux ethernet device and is responsible
-for administratively configurations of the fast-path vrpot, ex: SF or VF.
+for administratively configurations of the fast-path vport, ex: SF or VF.
 In typical use cases, representor netdev and its representee, vport,
-are one to one mapping: a VF/SF has a its own netdev for fast-path traffic,
+are 1-to-1 mapping: a VF/SF has a its own netdev for fast-path traffic,
 and another representor netdev for slow-path traffic.
-
-Such a design is reasonable with tens or hundred-ish vports. When scaling
+Such a design is reasonable with tens or hundred-ish vports but when scaling
 to thousands of VFs or SFs, the memory resource becomes a limiting factor.
 For example, with 1k representor netdevs, each with 4 RX queues, each RX
 queue takes around 3MB, and 1024 entries, the memory consumption can grow
@@ -93,24 +92,51 @@ to 12GB (4 * 3MB * 1024). We found that majority of memory comes from
 the RX memory buffers, i.e., the pre-allocation of RX queues that handles
 burst of incoming traffic.
 
-All the network device drivers pre-allocate a set of buffers and with
-multiple entries in its RX queue, configured by ethtool -G option.
-Nvidia MLX5, by default, pre-allocate 1024 entries in its RX queues,
-with each entry pointing to a MTU-sized buffer or a page (without
-striding RQ).
+% explain what's rx buffer
+The pre-allocation of RX queues and buffers are configured by Linux
+ethtool -G option, with different vendors setting different default
+value. Nvidia MLX5, by default, pre-allocates 1024 entries in each of
+its RX queues, with each entry pointing to a MTU-sized buffer or a page
+(without striding RQ). For Intel ICE, it's also 1024 entries. % need to check
+A trivial solution is to reduce the number of RX queue entries of
+representor netdevs, for example, from 1024 to 64 (the minimum of NAPI
+budget). Although this saves memory but a burst of traffic over 64 packets
+will be dropped, causing longer connection offload setup time.
 
-A trivial solution is to reduce the RX queue entries of representor
-netdevs, for example, from 1024 to 64 (the minimum of NAPI budget).
-This saves memory but a burst of traffic over 64 packets will be dropped,
-causing longer connection offload setup time.
+The paper describes the recent solution done by a couple vendor drivers.
+Instead of having one representor netdev per SF or VF, redirect all
+the slow-path traffic from all VFs/SFs to a single netdev, usually PF or
+uplink representor. As a result, the PF's RX queue receives all slow-path
+traffic from all other representors. In other word, all representors
+share the same RX queue memory pool provided by PF. The idea of using PF's
+RX qeueu as a shared memory pool is currently used by Intel ICE, Netronome,
+Broadcom bnxt, and SFC~\cite{duedeli}.
+%And this saves lots of memory because slow-path traffic is redirected to
+%PF, representors no longer needs to create its own RX queues and buffers.
+Experimental result shows that we can create 1K SFs and having the 1K
+representor netdev sharing its RX queue and buffers with PF. Although
+it saves lots of memory, but without large and real traffic experiment,
+it's hard to measure the performance impact of PF-based sharing memory
+pool versus no shared design. In addition, we found that when using share
+memory pool, a VM using a VF/SF can easily monopolize the entire memory
+pool, making another VM with VF/SF zero bandwidth. For example, a VM
+running dpdk-testpmd to send 4Mpps of UDP traffic can easily use the
+entire PF's shared memory pool, causing all the rest of VM starvation.
 
-The paper describes the recent solution. By redirecting all the representor
-netdev traffic to a single netdev, usually PF or uplink representor,
-a
+The situation is similar to buffer management problem in shared-memory
+packet switches, where the hardware switch has a shared memory pool
+for all its ports and how to guarantee both the performance and
+fairness~\cite{devlinksb}. The solution couldn't apply to
+our case because it's slow-path traffic, all the hardware traffic
+control or QoS features are not available.
+
+We describe more background in later section, design of the PF memory
+sharing pool, solution to the fairness problem, and finally some performance
+number.
+
 %This post an important question: how much memory buffer does a representor
 %netdev needs to pre-allocate for bursty traffic?
-
-
+\iffalse
 most of these representor netdevs' RX DMA memory
 is idle when flows are forwarded directly in hardware to VFs.
 In the recent case of smartnic or DPU (data processing unit) such as
@@ -125,6 +151,7 @@ first going through all existing solutions in different vendor drivers,
 intel, nvidia, broadcom, netronme, and sfc. And we present the shared
 memory pool design and implementation.
 We should that by sharing the memory 
+\fi
 
 \section{Background}
 %challenges and takeaways
