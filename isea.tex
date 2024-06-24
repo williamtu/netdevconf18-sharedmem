@@ -71,7 +71,7 @@ PF (Primary Functions of a PCIe device, with full access to the device's
 capabilities. PFs can manage multiple types of vports, including
 VFs (Virtual Functions) and SFs (Sub/Scalable Functions) and PF is
 responsible for the control and configuration of the device.
-The switchdev design follows the split model: a fast-path and slow-path.
+The switchdev design follows the split model: a fast-path and slow-path, shown in Figure~\ref{fig:arch}.
 A NIC with advanced offload capability and flow table rules is
 the fast-path, while a corresponding software switch that handles
 initial flow rule setup, or the miss traffic processing, is considered the
@@ -94,8 +94,8 @@ pointing to a 4K-sized page. Assume the netdev has 4 RX queues (controlled
 by ethtool -L combined), a netdev will consume 4 * 4K * 1024 = 16MB.
 With 1k representor netdevs, the memory consumption can grow
 to 16GB (16MB * 1024). We found that majority of memory comes from
-the RX memory buffers, i.e., the pre-allocation of RX queues that handles
-burst of incoming traffic.
+the RX memory buffers~\cite{jakub}, i.e., the pre-allocation of RX queues
+that handles burst of incoming traffic.
 
 % explain what's rx buffer
 The pre-allocation of RX queues and buffers are configured by Linux
@@ -115,7 +115,7 @@ uplink representor. As a result, the PF's RX queue receives all slow-path
 traffic from all other representors. In other word, all representors
 share the same RX queue memory pool provided by PF. The idea of using PF's
 RX qeueu as a shared memory pool is currently used by Intel ICE, Netronome,
-Broadcom bnxt, and SFC~\cite{duedeli}.
+Broadcom bnxt, and SFC~\cite{survey}.
 %And this saves lots of memory because slow-path traffic is redirected to
 %PF, representors no longer needs to create its own RX queues and buffers.
 Experimental result shows that we can create 1K SFs and having the 1K
@@ -131,7 +131,7 @@ entire PF's shared memory pool, causing all the rest of VM starvation.
 The situation is similar to buffer management problem in shared-memory
 packet switches, where the hardware switch has a shared memory pool
 for all its ports and how to guarantee both the performance and
-fairness~\cite{devlinksb}. The solution couldn't apply to
+fairness~\cite{devlinksb, queuelength}. The solution couldn't apply to
 our case because it's slow-path traffic, all the hardware traffic
 control or QoS features are not available.
 
@@ -139,10 +139,11 @@ We describe more background in later section, design of the PF memory
 sharing pool, solution to the fairness problem, and finally some performance
 number.
 \begin{figure}[h]
-\includegraphics[width=3.31in]{arch.pdf}
-\caption{This is an example of figure caption. Note that all figures, and tables are to be referenced in the text. \copyright Respect Copyright.}
+\includegraphics[width=3.4in]{arch.pdf}
+\caption{The fast and slow path model. The switchdev in NIC is the fast path handling
+hardware offloaded traffic among VFs/SFs, and the DPU which contains representor netdevs and software switch handles the slow path traffic.}
+\label{fig:arch}
 \end{figure}
-
 
 %This post an important question: how much memory buffer does a representor
 %netdev needs to pre-allocate for bursty traffic?
@@ -171,16 +172,19 @@ controllers, such as the Intel® Ethernet Controller E810. It is also known as
 a Virtual Ethernet Bridge (VEB). The eSwitch is managed by the Physical Function (PF)
 driver of the Ethernet or in the case of SmartNIC, managed by the ECPF (Embedded CPU
 s PF) that runs in the smartNIC's core. Eswitch can operate in two modes:
-Legacy mode and Switchdev mode. 
+Legacy mode and Switchdev mode.
 
 Legacy mode operates based on traditional MAC/VLAN steering rules. Switching
 decisions are made based on MAC addresses, VLANs, etc. There is limited ability
 to offload switching rules to hardware.
 On the other hand, switchdev mode allows for more advanced offloading
 capabilities of the E-Switch to hardware. In switchdev mode, more switching
-rules and logic can be offloaded to the hardware switch ASIC. It enables
-representor netdevices that represent the slow path of virtual functions (VFs)
-or scalable-functions (SFs) of the device. See more information about
+rules and logic can be offloaded to the hardware switch ASIC, for example
+push and pop tunneling protocol, connection tracking, etc.
+This mode requires a slow path, software components such as OVS or
+Linux bridge, and representor netdevices that handle miss traffic,
+the flows that can not be offloaded or miss the hardware flow table
+lookup, the slow path of VFs or SFs of the device.
 % $$:`Documentation/networking/switchdev.rst <switchdev>` and
 %:ref:`Documentation/networking/representors.rst <representors>`.
 % devlink dev eswitch show
@@ -188,57 +192,52 @@ or scalable-functions (SFs) of the device. See more information about
 % need to disable OVS hwoffload
 % so it's the iperf TX traffic on VF port that's going to overflow the PF's rxq
 
-\subsection{representors}
+\subsection{Representors}
+\begin{figure}[h]
+\includegraphics[width=3in]{pipe.pdf}
+\caption{.}
+\label{fig:arch}
+\end{figure}
 
-A representor has three main roles.
-1. It is used to configure the network connection the representee sees, e.g.
-   link up/down, MTU, etc.  For instance, bringing the representor
-administratively UP should cause the representee to see a link up / carrier
-   on event.
+A vport can be PFs (used by administrator), or VFs or SFs (assigned to VMs
+or containers). When the hardware offload table is empty, all packets are 
+processed by the slow path. Representor netdev and vport are like a linux
+pipe, shown in Figure~\ref{fig:pipe}: packets transmitted by the representor
+netdev are delivered to its vport; packets transmitted by the vport are
+received by the representor netdev, if it fails to match any offload rule.
 
-2. It provides the slow path for traffic which does not hit any offloaded
-   fast-path rules in the virtual switch.  Packets transmitted on the
-   representor netdevice should be delivered to the representee; packets
-  transmitted by the representee which fail to match any switching rule should
-  be received on the representor netdevice.  (That is, there is a virtual pipe 
-  connecting the representor to the representee, similar in concept to a veth
-  pair.)
-  This allows software switch implementations (such as OpenVSwitch or a Linux
-   bridge) to forward packets between representees and the rest of the network.
-   
- 3. It acts as a handle by which switching rules (such as TC filters) can refer
- to the representee, allowing these rules to be offloaded.
+% an end-to-end example
+For example in Figure~\ref{fig:arch}, VM1 would like to setup a new TCP
+connection to VM2. The first TCP syn packets sent from VM1 will miss the
+NIC switchdev's flow table, due to no match, and arrives at the receive
+queue of vport1's corresponding representor netdev, repr1.
+OVS in this case, with hardware-offload enabled, will parse the protocol
+and insert an offload rule, using Linux tc-flower interface.
+In addition, OVS also forwards/sends the packet to the repr2 port, which
+will deliver the packet to vport2's receive queue at VM2.
+While VM2 receives the TCP syn from VM1, VM2 replies with SYN+ACK, and
+again goes through the slow path. Until the connection is established
+and flow rules are in NIC's flow table, the TCP data stream will be
+going through the fast-path in NIC, and OVS in DPU no longer involves
+in any packet processing.
 
- 
- The combination of 2) and 3) means that the behaviour (apart from performance)
- should be the same whether a TC filter is offloaded or not.  E.g. a TC rule
- on a VF representor applies in software to packets received on that representor
- netdevice, while in hardware offload it would apply to packets transmitted by
-  the representee VF.  Conversely, a mirred egress redirect to a VF representor
-  corresponds in hardware to delivery directly to the representee VF.
- 
+Note that the behavior of the slow-path (representor ports and software
+switch) should be the same as fast-path (vports and switchdev).
+And because representor and vport are acting like pipe, so an OpenFlow
+rule on a representor netdev applies to a packet on its
+receive path is the same as it applies on vport's transmit path.
+
+\iffalse
 When the system boots, and before any offload is configured, all packets from
 the virtual functions appear in the networking stack of the PF via the
-representors.  The PF can thus always communicate freely with the virtual functions.
-
+representors.
 The PF can configure standard Linux forwarding between representors, the uplink
 or any other netdev (routing, bridging, TC classifiers).
-
 Thus, a representor is both a control plane object (representing the function in
 administrative commands) and a data plane object (one end of a virtual pipe).
+\fi
 
-As a virtual link endpoint, the representor can be configured like any other
-netdevice; in some cases (e.g. link state) the representee will follow the
-representor's configuration, while in others there are separate APIs to
-configure the representee.
- 
-A "representee" is the object that a representor represents.  So for example in
-the case of a VF representor, the representee is the corresponding VF.
-
-In addition, the devlink E-Switch also comes with other attributes listed
-in the following section.
-
-\subsection{Representor queues and its depth}
+\subsection{RX}
 A network device driver consists of several channels and each channel/queue
 represents an NAPI context and a set of queues that trigger that IRQ.
 devlink-sd considers only the *regular* RX queue in each channel,
@@ -276,8 +275,7 @@ and its data plance port function, vport or virtual port, and the vport's
 control plane object, called representors.
 
 \section{Design}
-table here shows existing driver's implementation
-
+table here shows existing driver's implementation~\cite{buffersize}
 \subsection{Nvidia mlx5 driver}
 \subsection{Intel ice driver}
 \subsection{Devlink Interface}
