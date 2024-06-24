@@ -32,42 +32,86 @@ witu@nvidia.com, michal.swiatkowski@intel.com, yossiku@nvidia.com\\
 \begin{document} 
 \maketitle
 \begin{abstract}
+Representor netdevs are special objects that controls the switchdev
+virtual port, which is the reprensentee. It configures administratively
+of the virtual port, as well as provides the slow path for traffic which
+does not hit any offloaded fast-path rules in the switchdev.
+%Packets transmitted by the representor netdev are delivered to the vport;
+%and packets tansmitted by the vport are received by the representor
+%netdev, if it fails to match any offload rule.
+When scaling to thousands of vports, a correpsonding thousands of
+representor netdevs are created, usually one vport has one representor
+netdev. With modern NIC containing advanced offload capabilities % what's intel's flow table size and offload cap?
+and increasing flow tale size, the role of representor netdev becomes
+lightweight but also critial. It processes the first couple of packets
+from a new connection, extracts the protocol information, and insert
+into the NIC hardware for subsequent packets to hit fast-path rules. 
 
+Creating thousands of representor netdevs becomes resource heavy for
+just handling the connection setup, especially for the SmartNIC or
+DPU (Data Processing Unit). A Nvidia Bluefield-2 only contains 16GB
+of memory, but with one thousand representor netdev can use up to
+12GB of RX memory buffer. A trivial solution is to trade-off the
+performance by reducing the RX queue entries, usually 1024, to a
+smaller number such as 64. The paper proposes saving these representor
+netdev's memory buffer by using a share memory pool, and a generic
+configuration UAPI through devlink for user to adjust the pool size. 
+ 
 \end{abstract}
 
 \section{Introduction}
 Modern network devices support advanced switching and offloading
-capabilities, called switchdev mode.
-In switchdev mode, users can create multiple virutal ports, vports,
-through sysfs and depending on their use cases, assigned to virtual
-machine or containers, or use it as another network device.
-Today, virtual ports in switchdev includes PF (primary functions of
-a PCIe device, providing full access to the device's capabilities.
-PFs can manage multiple VFs and SFs and are responsible for the
-overall control and configuration of the device.),
-VF (VFs are a type of PCIe function that allows for the partitioning
-of a physical network device into multiple virtual devices. ), and SF
-SFs, subfunction or scalable function, are portions of a PCI device
-that share resources with physical function.
+capabilities, called switchdev mode. In switchdev mode, users can
+create multiple virutal ports, or vports, through sysfs and assign
+vports to virtual machine or containers. The switchdev mode includes
+PF (Primary Functions of a PCIe device, with full access to the device's
+capabilities. PFs can manage multiple types of vports, including
+VFs (Virtual Functions) and SFs (Sub/Scalable Functions) and PF is
+responsible for the control and configuration of the device.
+The switchdev design follows the split model: a fast-path and slow-path.
+A NIC with advanced offload capability and flow table rules is
+the fast-path, while a corresponding software switch that handles
+initial flow rule setup, or the miss traffic, is considered the
+slow-path. Different vendors such as Nvidia Connect-X or Intel ICE
+supports different offload capabilities, but they follow similar
+software slow-path design, with OVS or Linux bridge attached with
+the slow-path vport, running either on host CPUs or SmartNIC/DPU
+ARM cores.
 
-In switchdev mode, a special netdev called representors are created to
-provides the slow path for traffic which does not hit any offloaded
-fast-path rules in the virtual switch.
+The slow-path ports that handles miss traffic is called representor
+netdevs, registerd as a regular Linux ethernet device and is responsible
+for administratively configurations of the fast-path vrpot, ex: SF or VF.
+In typical use cases, representor netdev and its representee, vport,
+are one to one mapping: a VF/SF has a its own netdev for fast-path traffic,
+and another representor netdev for slow-path traffic.
 
-representor also 
-configure the network connection the representee sees, e.g.
- link up/down, MTU, e
-In typical use case, representor and representee are 1:1, e.g,
+Such a design is reasonable with tens or hundred-ish vports. When scaling
+to thousands of VFs or SFs, the memory resource becomes a limiting factor.
+For example, with 1k representor netdevs, each with 4 RX queues, each RX
+queue takes around 3MB, and 1024 entries, the memory consumption can grow
+to 12GB (4 * 3MB * 1024). We found that majority of memory comes from
+the RX memory buffers, i.e., the pre-allocation of RX queues that handles
+burst of incoming traffic.
 
-%are slow-path ports that handle the
-%miss traffic, i.e., traffic not being forwarded by the hardware.
-As Representor ports are regular Ethernet devices, with multiple channels
-consuming DMA memory. Memory consumption of the representor
-port's rx buffers can grow to several GB when scaling to 1k VFs reps.
-For example, in mlx5 driver, each RQ, with a typical 1K descriptors,
-consumes 3MB of DMA memory for packet buffer in descriptors, and with
-four channels, it consumes 4 * 3MB * 1024 = 12GB of memory. Since rep
-ports are for slow path traffic, most of these rep ports' rx DMA memory
+All the network device drivers pre-allocate a set of buffers and with
+multiple entries in its RX queue, configured by ethtool -G option.
+Nvidia MLX5, by default, pre-allocate 1024 entries in its RX queues,
+with each entry pointing to a MTU-sized buffer or a page (without
+striding RQ).
+
+A trivial solution is to reduce the RX queue entries of representor
+netdevs, for example, from 1024 to 64 (the minimum of NAPI budget).
+This saves memory but a burst of traffic over 64 packets will be dropped,
+causing longer connection offload setup time.
+
+The paper describes the recent solution. By redirecting all the representor
+netdev traffic to a single netdev, usually PF or uplink representor,
+a
+%This post an important question: how much memory buffer does a representor
+%netdev needs to pre-allocate for bursty traffic?
+
+
+most of these representor netdevs' RX DMA memory
 is idle when flows are forwarded directly in hardware to VFs.
 In the recent case of smartnic or DPU (data processing unit) such as
 Nvidia BlueField and Intel IPU, only the VFs and SFs and a light-weight PF
