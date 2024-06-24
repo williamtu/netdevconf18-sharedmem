@@ -89,9 +89,11 @@ are 1-to-1 mapping: a VF/SF has a its own netdev for fast-path traffic,
 and another representor netdev for slow-path traffic.
 Such a design is reasonable with tens or hundred-ish vports but when scaling
 to thousands of VFs or SFs, the memory resource becomes a limiting factor.
-For example, with 1k representor netdevs, each with 4 RX queues, each RX
-queue takes around 3MB, and 1024 entries, the memory consumption can grow
-to 12GB (4 * 3MB * 1024). We found that majority of memory comes from
+For example, assuming each RX queue has 1024 entries, and each entry
+pointing to a 4K-sized page. Assume the netdev has 4 RX queues (controlled
+by ethtool -L combined), a netdev will consume 4 * 4K * 1024 = 16MB.
+With 1k representor netdevs, the memory consumption can grow
+to 16GB (16MB * 1024). We found that majority of memory comes from
 the RX memory buffers, i.e., the pre-allocation of RX queues that handles
 burst of incoming traffic.
 
@@ -136,6 +138,11 @@ control or QoS features are not available.
 We describe more background in later section, design of the PF memory
 sharing pool, solution to the fairness problem, and finally some performance
 number.
+\begin{figure}[h]
+\includegraphics[width=3.31in]{arch.pdf}
+\caption{This is an example of figure caption. Note that all figures, and tables are to be referenced in the text. \copyright Respect Copyright.}
+\end{figure}
+
 
 %This post an important question: how much memory buffer does a representor
 %netdev needs to pre-allocate for bursty traffic?
