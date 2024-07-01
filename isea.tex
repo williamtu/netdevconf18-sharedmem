@@ -7,6 +7,34 @@
 \usepackage{times}
 \usepackage{helvet}
 \usepackage{courier}
+\usepackage{listings}
+\usepackage{appendix}
+\usepackage{xcolor} % Optional, for color customization
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\scriptsize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
 \usepackage[numbers]{natbib}
 \pdfinfo{
 /Title (Shared Memory Pool for Representors)
@@ -137,7 +165,18 @@ control or QoS features are not available.
 
 We describe more background in later section, design of the PF memory
 sharing pool, solution to the fairness problem, and finally some performance
-number.
+number. The paper has the following contributions:
+\begin{itemize}
+    \item Present the memory consumption requirements for scaling to
+          thousands of devices.
+    \item Describe the existing solutions from different driver vendors,
+          using shared RX queue provided by PF.
+    \item Propose a solution to save memory per RX queue by dynamically
+          post and reclaim pages.
+    \item Propose a solution using a shared page pool for all netdevs,
+          with inherent fairness mechanism.
+\end{itemize}
+
 \begin{figure}[h]
 \includegraphics[width=3.4in]{arch.pdf}
 \caption{The fast and slow path model. The switchdev in NIC is the fast path handling
@@ -193,11 +232,6 @@ lookup, the slow path of VFs or SFs of the device.
 % so it's the iperf TX traffic on VF port that's going to overflow the PF's rxq
 
 \subsection{Representors}
-\begin{figure}[h]
-\includegraphics[width=3in]{pipe.pdf}
-\caption{.}
-\label{fig:arch}
-\end{figure}
 
 A vport can be PFs (used by administrator), or VFs or SFs (assigned to VMs
 or containers). When the hardware offload table is empty, all packets are 
@@ -226,6 +260,14 @@ switch) should be the same as fast-path (vports and switchdev).
 And because representor and vport are acting like pipe, so an OpenFlow
 rule on a representor netdev applies to a packet on its
 receive path is the same as it applies on vport's transmit path.
+\begin{figure}[h]
+\includegraphics[width=1.5in]{pipe.pdf}
+\centering
+\caption{The vport and representor: packets transmitted by the representor 
+netdev are delivered to its vport; packets transmitted by the vport are
+received by the representor netdev, if it fails to match any offload rule.}
+\label{fig:arch}
+\end{figure}
 
 \iffalse
 When the system boots, and before any offload is configured, all packets from
@@ -237,49 +279,124 @@ Thus, a representor is both a control plane object (representing the function in
 administrative commands) and a data plane object (one end of a virtual pipe).
 \fi
 
-\subsection{RX}
-A network device driver consists of several channels and each channel/queue
-represents an NAPI context and a set of queues that trigger that IRQ.
-devlink-sd considers only the *regular* RX queue in each channel,
-e.g., mlx5's non-regular RQs such as XSK RQ and drop RQ are not applicable
-here. Each device driver receives packets by setting up RQ, and
-each RQ receives packets by pre-allocating a dedicated set of rx
-ring descriptors, with each descriptor pointing to a memory buffer.
-The ``shared descriptor pool`` is a descriptor and buffer sharing
-mechanism. It allows multiple RQs to use the rx ring descriptors
-from the shared descriptor pool. In other words, the RQ no longer has
-its own dedicated rx ring descriptors, which might be idle when there
-is no traffic, but it consumes the descriptors from the descriptor
-pool only when packets arrive.
+\subsection{Memory Pre-allocation}
+Network device drivers need to buffer the incoming packet from network,
+by pre-allocating memory for received packets. Once the packets arrive,
+NIC can DMA a batch of packets into these pre-allocated buffers,
+potentially hundreds of them, before the host CPU is notified/kicked in
+by interrupts to process these packets.
+For performance reason, NIC contains multiple channels with each channel
+represents an NAPI context and an IRQ to kick in to process rx packet.
+Usually the number of channel is the same as number of CPU that involves
+in packet processing.
+In typical case, a channel contains a packet receive queue,
+and by default the RX queue contains several entries, with each entries
+point to a packet buffer. So the amount of pre-allocated memory for RX
+is a product of buffer size * number of queues * queue depth.
+A typical example of a data center server with 64 cores would be:
+4k * 64 queues * 1k entries = 256MB.
 
-The shared descriptor pool contains rx descriptors and its memory
-buffers. When multiple representors' RQs share the same pool of rx
-descriptors, they share the same set of memory buffers. As a result,
-the heavy-traffic representors can use all descriptors from the pool,
-while the idle, no-traffic representor consumes no memory. All the
-descriptors in the descriptor pool can be used by all the RQs. This
-makes the descriptor memory usage more efficient.
+Note that the queue depth, or the number of entries in RX queue, is
+not only for tolerating the burstness of traffic, but also the CPU
+processing time/jitter of a packet. When CPU is under heavy loading,
+a packet arriving RX interrupt might not be able to immediately
+kick in the CPU to process packets. Thus a deeper queue depth can
+avoid packets being dropped.
+In addition, each packet usually has different processing time.
+The time for CPU to process a TLS packet is definitely longer than
+an ARP packet. Thus, a deeper RX queue also helps avoiding packets
+dropped due to intermittently longer packet processing time.
 
 
-% explain eswitch, virtual port vport, representors, and port
-% eswitch has vport
-% vport nic 
-As software-defined network and standards such as OpenFlow or tc-flower
-requires more and more performance, network card vendors started to offer
-complex virtualization capabilities than the legacy layer 2 mac/vlan switch
-SR-IOV features, this leads to many new features and design in hardware offload
-and device abstraction in Linux kernel.
-This section talks about switchdev mode, the mode that enables
-modern advanced hardware offloading capabilities as a hardware switch device,
-and its data plance port function, vport or virtual port, and the vport's
-control plane object, called representors.
+
+However, memory in not cheap, especially when scaling to 1K devices
+and with 1k representor netdevs in DPU. And having several GBs of
+pre-allocated memory idle just waiting for a burst of traffic
+or even unused when the low traffic volume is a huge resource waste.
+We discuss our solution in later section.
 
 \section{Design}
-table here shows existing driver's implementation~\cite{buffersize}
-\subsection{Nvidia mlx5 driver}
-\subsection{Intel ice driver}
-\subsection{Devlink Interface}
+% table here shows existing driver's implementation~\cite{buffersize}
+We'd like to support 1K of SFs/VFs with representor netdevs
+on DPU, with the following requirements: 1) 1k netdev creation time
+around 10 minutes, including configurations and bringing the device up,
+2) memory consumption of DPU system is within
+system limit, and 3) all the VFs/SFs representor get fair share
+of receive memory buffer, which leads to fair share of bandwidth.
+With that in mind, we describe three solutions: Shared RX queue with PF,
+Adjustable RX queue, and Adjustable RX queue with meters. 
 
+\subsection{Shared RX Queue with Service Netdev}
+Since the representor netdev only handles the miss traffic or first
+few packets for connection setup, existing solution is to assign a
+a dedicated service netdev for handling \emph{all} traffic from other
+representors. This dedicated service netdev acts like an intermedia
+multiplex layer, it sees all slow path traffic from all the
+reprensentors, and lookup an internal data structure to identify the
+orignal source of VF/SF, reconstruct the skb->dev to the correct
+orignal netdev, and pass up kernel stack. As a result, the representor
+netdev no longer sees packets and no need to allocate RX queue.
+
+Service netdev can be any netdev, but commonly used are PF or the uplink
+representor netdev. For Intel ICE driver, PF is used to receive all other
+reprensetor's traffic.
+Different vendors have different design, but in general, the device
+driver needs to do the following:
+
+%Recall that in Figure~\ref{fig:pipe} the representor and vport are like pipe.
+\begin{itemize}
+\item RX hardware steering: instead of sending slow-path traffic to
+each individual representors, the NIC needs to steer/redirect all
+slow-path traffic to the service netdev, and mark the packet's orignal
+vport information, vport\_id, in metadata or packet buffer.
+\item RX software: the service netdev now sees all traffic including
+others arriving at its RX queues. It needs to keeps a map of vport\_id
+to the packet's original netdev struct. By extracting the vport\_id
+from metadata, the orignal netdev is restored to sk\_buff and continue
+kernel network stack. The representor netdev no longer allocates memory
+for RX queues and buffers.
+%it is able to distinguish which vport the packet
+\item TX: because the vport and representor act like a pipe, the service
+netdev need to know which vport's RX queue the packet should be \emph{send}
+to. Drivers can use the dst\_entry of skb, or other per-packet metadata
+field, and rely on internal switch to deliver the packet to the vport.
+\end{itemize}
+
+\emph{pros and cons:}
+The shared rx queue solution saves lots of memory by redirecting
+all traffic to service netdev, because it consumes only one service
+netdev's memory. Depending on number of SF/VFs and traffic volume,
+users need to configure two parameters of service netdev:
+\begin{itemize}
+    \item the number of RX queues should increase to decrease the chance
+    of multiple flows from multiple vports rxhash to the same queue.
+    (ethtool -L combined) Today, the max RX queue is usually limited by
+    number of CPUs.
+    \item the RX queue depth should increase to absorb more traffic
+    burst from multiple vports. (ethtool -G rx)
+    \item reduce the NAPI schedule delay, which means napi can process
+    packets as soon as possible when packets arrived, can reduce the queue
+    depth grows to fast. (I don't know any tool to do this)
+\end{itemize}
+
+The design is simple to implement, but we found that it suffers from
+a fairness issue. A single high volume sender, ex: dpdk-pktgen,
+sending to its vport and arrives at slow path, can easily consume all
+the buffers in the service netdev's RX queue, making other representor's
+traffic being dropped. An example setup script to show case the issue
+using OVS and Linux bridge is provided in Appendix.
+
+\newpage
+\subsection{Adjustable RX Queues}
+
+
+
+\subsection{Adjustable RX Queues with Hardware meters}
+
+%\subsection{Nvidia mlx5 driver}
+%\subsection{Intel ice driver}
+%\subsection{Devlink Interface}
+%\subsection{dynamic buffer allocation}
 \section{Challenges}
 \section{Thanks}
 
@@ -295,30 +412,6 @@ A variety of paper lengths will be accepted under different categories. Please n
 
 \section{Style and Format}
 Templates that implement these instructions can be retrieved electronically at {\small \tt http://isea2015.org}
-
-\subsection{Layout}
-
-Print manuscripts two columns to a page, in the manner in which these instructions are printed. The exact dimensions for pages are:
-\begin{itemize}
-\item left and right margins: 0.75''
-\item column width: 3.31''
-\item gap between columns: 0.38''
-\item top margin—first page: 1.25''
-\item top margin—other pages: 0.75''
-\item bottom margin: 1.25''
-\end{itemize}
-
-\subsection{Format of Electronic Manuscript}
-
-For the production of the electronic manuscript, you must use {\em Adobe's Portable Document Format} (PDF). Additionally, you must specify the American {\em letter} format (corresponding to 8-1/2'' x 11'') when formatting the paper.
-
-\subsection{Blind Review}
-
-All papers will be reviewed in a single blind manner.  You are at liberty to include your affiliation and cite your papers in a natural manner, and you are also at liberty to anonymize the text if you so desire, in which case, keeping your identity secret is your responsibility.
-
-\subsection{Title and Author Information}
-
-Center the title on the entire width of the page in a 16-point bold font. Below it, center the author name(s) in a 12-point bold font, and then center the address(es) in a 9-point regular font. Credit to a sponsoring agency can appear in the Acknowledgment Section described below.
 
 \begin{figure}[h]
 \includegraphics[width=3.31in]{figure.png}
@@ -395,14 +488,15 @@ The title ``Bibliography'' should be 12 point, bold style, centered. Using 9 poi
 The title ``Author(s) Biography(ies)'' should be 12 point, bold style, centered. Using 9 point, regular type, biographies should be no longer than 150-word count.
 
 \section{Questions?}
+% discussion
+% NAPI budget, net_dim, API
+% why hardware and software TC QOS doesn't work
 
 For technical questions about Microsoft Word formatting please seek online tutorials. For other questions about your manuscript please contact: {\tt ISEA2015-info@sfu.ca}
 
-
 \bibliographystyle{isea}
 \bibliography{isea}
-
-
+\include{ovs-script}
 \end{document}
 %challenges and takeaways
 %\begin{figure}[h]
