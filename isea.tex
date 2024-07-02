@@ -327,6 +327,15 @@ With that in mind, we describe three solutions: Shared RX queue with PF,
 Adjustable RX queue, and Adjustable RX queue with meters. 
 
 \subsection{Shared RX Queue with Service Netdev}
+\begin{figure}[h]
+\includegraphics[width=2in]{design1.pdf}
+\centering
+\caption{Shared RX Queue: A PF/uplink-representor netdev receieves all slow-path traffic
+for other representors, and reconstructs their skb and passes to upper
+network stacks.}
+\label{fig:arch}
+\end{figure}
+
 Since the representor netdev only handles the miss traffic or first
 few packets for connection setup, existing solution is to assign a
 a dedicated service netdev for handling \emph{all} traffic from other
@@ -386,9 +395,109 @@ the buffers in the service netdev's RX queue, making other representor's
 traffic being dropped. An example setup script to show case the issue
 using OVS and Linux bridge is provided in Appendix.
 
-\newpage
 \subsection{Adjustable RX Queues}
+Since sharing the RX Queues of PF or uplink representor suffers fairness
+issue, another solution is to {\em not} sharing the RX queue. That is, each
+representor acts like a regular netdevs, with its own RX queues and RX buffers.
 
+To save memory, for every queue in every netdev, instead of doing the
+static RX queue allocation, which always allocating to \emph{full} RX queue
+depth, we propose to dynamically adjust RX queue.
+For example, an mlx5 driver, by default, always tries to allocate to
+full 1024 rxq buffers. Instead, the following logic is applied when
+a driver is receiving packets in its NAPI context:
+\begin{itemize}
+    \item NAPI busy: allocate buffers and refill to full queue depth.
+    \item NAPI interrupt: allocate buffers and refill to low watermark if
+    current queue depth is lower than low watermark
+    \item NAPI interrupt: do not allocate and refill if current queue
+    depth is higher than low\_watermark.
+\end{itemize}
+
+We set the low\_watermark to be 128 (2 * NAPI\_BUDGET). 
+The low\_watermark means the minimal available buffers to handle the
+worst case of traffic burst. At driver initialization time, all queues
+are allocated only up-to the low\_watermark. Once the first burst
+of traffic arrives, users might see more packets dropped compared
+to full rxq depth allocation (1024). Fortunately, a NAPI busy state will
+trigger driver to refill to its full rxq depth, making the performance
+impact minimal. In this design, we pay the performance price to save
+memory. The first burst traffic of a connection see more packets dropped,
+and once in NAPI-busy, the driver acts the same as static RX queue
+allocation.
+
+The high\_watermark is the max RX queue depth, which is the same value
+set in static allocation, the rxq depth set by (ethtool -G rx)
+
+Such a design saves memory at driver initialization, as well as the
+NAPI-interrupt
+state will slowly return page back to kernel due to packet arrives but
+driver does not allocate and refill. However, what if an rxq is in
+NAPI-interrupt, but there is no packet arrived to trigger returning
+pages to system? Then driver needs to detect and drain the RX queue
+back to the low\_watermark.
+
+\textit{pros and cons:} 
+
+\subsection{Adjustable RX Queues with Shared Page Pool}
+
+Currently each queue creates its own kernel page pool, and in NAPI, refilling
+the RXQ buffer by getting a page pool entry from its own per-queue page pool.
+When scaling to thousands of representor netdevs, there is no guarantee that
+all the representor netdev gets fair share of system memory. That is, the late
+coming netdevs might see system out-of-memory for initializing its RXQ ,
+even with the Adjustable RX Qeueue design.
+
+We propose shared page pool, a layer of page pool that runs on top of current
+Linux page pool APIs. The shared page pool supports for a group of netdevs
+to register as user, and the shared memory pool fairly allocate memory for
+each users based on the its current usage and total available memory in
+the pool.
+
+Figure~\ref{fig:design3} shows the idea.
+Assume N representor netdevs, each has one rxq. In the beginning, the master
+netdev, PF or uplink representor, creates the shared page pool, and join
+itself into the pool. The netdevs created later join the shared page pool,
+by registering itself to the pool, can call the alloc and free API to
+returns the page into shared pool. We assume \emph{no lock} is required,
+by creating the shared page pool per-CPU NAPI context, which NAPI scheduler
+will guarantee not scheduling two NAPIs poll sharing the same pool on different
+core.
+
+We define the following C APIs:
+\begin{verbatim}
+# Uplink representor creates the page pool,
+# return the handler of shared pool
+spp = shared_pp_create(
+    max_num_devs, page_pool_size, …);
+
+# Return a user id for registerd user
+spp_uid1 = shared_pp_join(spp, netdev-rep1,
+    qid, threshold);
+spp_uid2 = shared_pp_join(spp, netdev-rep2,
+    qid, threshold);
+
+# Representor NAPI processes packets and
+# refills, and bounded by max_usage, return
+# -ENOMEM if overflow
+shared_pp_dev_alloc_page(spp, spp_uid1);
+shared_pp_dev_alloc_page(spp, spp_uid2);
+shared_pp_put_page(spp, spp_uid1);
+
+#Leave the share page pool
+shared_pp_leave(spp, spp_uid1); 
+\end{verbatim}
+
+The shared memory pool enforces a max number of allocated buffer for each user.
+We take the idea from Shared-MemoryHardware Switch~\cite{sharedswitch}
+For each netdev rxq requesting N memory, there is a limitation of
+current max rxq depth = alpha * free buffer.
+      
+When page pool is under memory stress, the 
+The max usage:
+
+The shared page pool allows multiple netdev queues to
+allocate memory for its own queues and throttle/reject the netdev n
 
 
 \subsection{Adjustable RX Queues with Hardware meters}
