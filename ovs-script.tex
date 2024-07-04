@@ -1,7 +1,8 @@
-
 \section{OVS Script} \label{sec:bash_script}
 \begin{lstlisting}[language=sh, caption={Bash Script for Database Backup}, label={lst:bash_script}]
 #!/bin/bash
+
+# similar setup for Linux bridge, but disable HW offload by setting aging=0
 PF1=eth2
 VFREP1=eth4
 VFREP2=eth5
