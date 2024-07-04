@@ -91,19 +91,11 @@ and present some of the performance numbers.
 
 \end{abstract}
 \begin{figure}[h]
-\includegraphics[width=3in]{freemem.pdf}
-\caption{The fast and slow path model. The switchdev in NIC is the fast path handling
-hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic.}
+\includegraphics[width=3.2
+in]{freemem.pdf}
+\caption{.}
 \label{fig:arch}
 \end{figure}
-\begin{figure}[h]
-\includegraphics[width=3.2in]{arch.pdf}
-\caption{The fast and slow path model. The switchdev in NIC is the fast path handling
-hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic.}
-\label{fig:arch}
-\end{figure}
-
-
 
 \section{Introduction}
 Modern network devices support advanced switching and offloading
@@ -194,6 +186,14 @@ number. The paper has the following contributions:
     \item Propose a solution using a shared page pool for all netdevs,
           with inherent fairness mechanism.
 \end{itemize}
+
+\begin{figure}[h]
+\includegraphics[width=3.2in]{arch.pdf}
+\caption{The fast and slow path model. The switchdev in NIC is the fast path handling
+hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic.}
+\label{fig:arch}
+\end{figure}
+
 
 
 %This post an important question: how much memory buffer does a representor
