@@ -90,14 +90,19 @@ and present some of the performance numbers.
 
 
 \end{abstract}
-%fig1: 
-%fig2:
+\begin{figure}[h]
+\includegraphics[width=3in]{freemem.pdf}
+\caption{The fast and slow path model. The switchdev in NIC is the fast path handling
+hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic.}
+\label{fig:arch}
+\end{figure}
 \begin{figure}[h]
 \includegraphics[width=3.2in]{arch.pdf}
 \caption{The fast and slow path model. The switchdev in NIC is the fast path handling
 hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic.}
 \label{fig:arch}
 \end{figure}
+
 
 
 \section{Introduction}
