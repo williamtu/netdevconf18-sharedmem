@@ -610,8 +610,16 @@ With this, existing drivers will need to consider supporting both
 modes, shared RXQ mode or dedicated mode. (Or return -ENOSUPP).
 
 \section{Performance Evaluation}
+\begin{figure}[t!]
+\includegraphics[width=2.6in]{testbed.pdf}
+\centering
+\caption{}
+\label{fig:testbed}
+\end{figure}
+
 We conduct our experiment with two servers connected back-to-back using
-two x86 host. Each host is equipped with one dual port BlueField-2 card.
+two x86 host, shown in Figure~\ref{fig:testbed}.
+Each host is equipped with one dual port BlueField-2 card.
 Each x86 host consists of 10 cores and 32GB of RAM. The BlueField-2
 is an 8-cores Cortex-A72, with 16GB of RAM. BlueField, by default, runs OVS kernel
 datapath with hardware-offload enabled.
