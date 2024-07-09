@@ -7,10 +7,13 @@
 \usepackage{times}
 \usepackage{helvet}
 \usepackage{courier}
+\usepackage{float}
 \usepackage{listings}
 \usepackage{appendix}
 \usepackage{xcolor} % Optional, for color customization
 \usepackage{amsmath}
+\usepackage{array}
+\usepackage{tabularx} % Required for adjustable-width tables
 
 \definecolor{codegreen}{rgb}{0,0.6,0}
 \definecolor{codegray}{rgb}{0.5,0.5,0.5}
@@ -50,6 +53,9 @@
 % ICE has limit of 1k hw queues so must share
 % 
 
+% TODO: motivation for Intel: not enough hardware queue, max 1K
+% mellanox does not have this limitation
+
 \title{Shared Memory Pool for Representors}
 \author{William Tu, Michal Swiatkowski, and Yossi Kuperman\\
 Nvidia and Intel\\
@@ -88,14 +94,16 @@ and 3) adjusting the RX queue with a fair shared page pool.
 We describe the design of these solutions, their implementations,
 and present some of the performance numbers.
 
-
 \end{abstract}
+
+\iffalse
 \begin{figure}[h]
 \includegraphics[width=3.2
 in]{freemem.pdf}
-\caption{.}
+\caption{The available memory in the system decreases from 14GB to 0.5GB when creating from 0 to 340 SFs and representors on Nvidia BlueField-2 (total 16GB memory).}
 \label{fig:arch}
 \end{figure}
+\fi
 
 \section{Introduction}
 Modern network devices support advanced switching and offloading
@@ -186,8 +194,9 @@ number. The paper has the following contributions:
     \item Propose a solution using a shared page pool for all netdevs,
           with inherent fairness mechanism.
 \end{itemize}
+We welcome anyone to review and correct any content in any format (PR, or email to us)\footnote{source: https://github.com/williamtu/netdevconf18-sharedmem}.
 
-\begin{figure}[h]
+\begin{figure}[t!]
 \includegraphics[width=3.2in]{arch.pdf}
 \caption{The fast and slow path model. The switchdev in NIC is the fast path handling
 hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic.}
@@ -242,7 +251,7 @@ flow table lookup from the VFs/SFs.
 % devlink dev eswitch set mode switchdev
 % need to disable OVS hwoffload
 % so it's the iperf TX traffic on VF port that's going to overflow the PF's rxq
-\begin{figure}[h]
+\begin{figure}[t!]
 \includegraphics[width=1.5in]{pipe.pdf}
 \centering
 \caption{The vport (representee) and representor: packets transmitted by the representor 
@@ -325,7 +334,7 @@ pre-allocated memory idle just waiting for a burst of traffic
 or even unused when the low traffic volume is a huge resource waste.
 We discuss different solutions in later section.
 
-\begin{figure}[h]
+\begin{figure}[t!]
 \includegraphics[width=2.6in]{rxq.pdf}
 \centering
 \caption{Network driver allocates buffers to fill its RX queue. NIC DMA packet
@@ -350,7 +359,9 @@ B. Adjustable RXQ with share page pool, and C. Shared RXQ with hardware meters.
 %Shared RX queue saves memory but fairness
 %Not sharing uses too much memory
 \subsection{A. Shared RXQ of PF}
-\begin{figure}[h]
+% pros: assumption: not all send at the same time
+
+\begin{figure}[t!]
 \includegraphics[width=2in]{design1.pdf}
 \centering
 \caption{Shared RX Queue: A PF/uplink-representor netdev receieves all slow-path traffic
@@ -358,6 +369,8 @@ for other representors, and reconstructs their skb and passes to upper
 network stacks.}
 \label{fig:arch}
 \end{figure}
+
+The assumption of the design is that not all send at the same time.
 
 Since the representor netdev only handles the miss traffic or first
 few packets for connection setup, existing solution is to assign a
@@ -462,7 +475,7 @@ back to the low\_watermark.
 
 \textit{pros and cons:} 
 
-\begin{figure}[h]
+\begin{figure}[t!]
 \includegraphics[width=2.6in]{shared_page_pool.pdf}
 \centering
 \caption{The adjustable RX queues with shared page pool allows multiple}
@@ -547,24 +560,137 @@ Another approach to solve the fairness and memory issue is to seek for hardware
 support. This design uses the shared page pool for multiple representor netdevs,
 but instead of changing 
 
-\subsection{A. Norah Tu}
-\subsection{B. Liam Tu}
+\section{Implementation}
+Most of the network device drivers with representor chooses the shared
+RX Queue design, which saves memory at the price of possible
+fairness limitation. Table~\ref{tab:vendors} show a summary of 
+\begin{table}[h!]
+\centering
+\footnotesize
+\begin{tabular}{|l|l|} \hline
+\textbf{Driver} &  \textbf{Implementation}\\ \hline \hline
+Nvidia MLX5 & Dedicated repr netdevs \\ \hline
+Intel ICE & Shared RXQ of PF~\cite{icepatch} \\ \hline
+Broadcom BNXT & Shared RXQ of PF ~\cite{survey} \\ \hline
+Netronome NFP & Shared RXQ of PF~\cite{survey} \\ \hline
+Solarflare SFC &  Shared RXQ of PF~\cite{survey} \\ \hline
+Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
+\end{tabular}
+\caption{Memory consumption of a SF-repr and its breakdown of page pool and Firmware usage.}
+\label{tab:vendors}
+\end{table}
+
+
+\section{Performance Evaluation}
+We conduct our experiment with two servers connected back-to-back using
+two x86 host. Each host is equipped with one dual port BlueField-2 card.
+Each x86 host consists of 10 cores and 32GB of RAM. The BlueField-2
+is an 8-cores Cortex-A72, with 16GB of RAM. BlueField, by default, runs OVS kernel
+datapath with hardware-offload enabled.
+
+\subsection{Memory Consumption}
+Linux kernel today provides several memory profiling tool, such as /proc/meminfo,
+/proc/slabinfo. However, there is no tool to measure how much memory is consumed
+by a particular network device driver, or a netdev. We start by creating 200 SF representors,
+and measure the difference of the total system free mem, MemFree field in /proc/meminfo.
+The SF creation and setup is done by the script in Listing~\ref{lst:sf}.
+
+Table~\ref{tab:memory} shows the memory consumption of each SF-repr and its breakdown.
+We conclude that, by default RXQ depth of 1024, one SF-repr takes 2.86MB of kernel
+memory, and among the 2.86MB, 1.83 is consumed by page pool for the RXQ buffers,
+around 0.11MB is consumed by firmware, and the rest of 0.9MB is for others
+such as slab, ex: kmalloc, kzalloc, and other kernel netdev structures.
+When increase from 1 RXQ to 2 RXQs, the memory consumption also increases linearly, as expected.
+
+\begin{table}[h!]
+\centering
+\footnotesize
+
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+\textbf{} & \textbf{1RXQ total} & \textbf{Page Pool} & \textbf{FW} & \textbf{2RXQ} \\ \hline \hline
+\textbf{128}  & 1.1   & 0.2  & 0.113 & 2.835 \\ \hline
+\textbf{256}  & 1.3   & 0.4  & 0.114 & 2.915 \\ \hline
+\textbf{512}  & 1.805 & 0.78 & 0.114 & 2.99  \\ \hline
+\textbf{1024} & 2.86  & 1.83 & 0.114 & 5.025 \\ \hline
+\textbf{2048} & 4.935 & 3.93 & 0.115 & 9.25  \\ \hline
+\end{tabular}
+\caption{Memory consumption of a SF-repr and its breakdown of page pool and Firmware usage.}
+\label{tab:memory}
+\end{table}
+
+\subsection{Static Queue Size}
+Before enabling the dynamic adjustable RXQ size, we first analyze the performance impact
+of statically configure different RXQ size, from queue depth of 64 to 2048.
+We ran Apache ab benchmark~\cite{ab}, with client on one of the x86 host and
+server on another x86 host. We disable OVS hardware-offload in DPU so that all traffic
+can flow through the representor netdev. We than statically adjust the representor
+netdev's RXQ depth using ethtool -G. 
+
+Table~\ref{tab:ab1} shows the result of Apache ab benchmark sending 1 million requests
+with concurrency level of 100. We report the following metrics:
+\begin{itemize}
+    \item Time to complete (sec): total time taken for completing the 1 million requests.
+    \item out\ of\ buffers (K): a firmware counter, rx\_out\_of\_buffer, reporting number of packets dropped due to no RXQ buffer available.
+    \item Requests (K) / sec: average HTTP requests per seconds
+    \item Connection Time (ms) and SD: average connection time, including connect, processing, and waiting, of the 1 million connections and their standard deviation (SD).
+\end{itemize}
+We found although larger queue depth, 1024 or 2048, consumes more memory, but they
+performance comparatively well, as they shows shorter time to complete, less packets
+being dropped, and lower jittering (SD is smaller).
+
+\begin{table}[h!]
+\centering
+\footnotesize
+\begin{tabular}{|p{0.6cm}|p{1.2cm}|p{1.2cm}|p{1.2cm}|p{0.8cm}|p{1cm}|} \hline
+\textbf{} & \textbf{Time to complete (sec)} & \textbf{out of buffers (K)} & \textbf{Requests / sec (K)} & \textbf{Conn Time (ms)} & \textbf{Conn Time SD} \\ \hline \hline
+\textbf{64}   & 45.6  & 104   & 21.9 & 5 & 32  \\ \hline
+\textbf{128}  & 29.48 & 71    & 33.9 & 3 & 20  \\ \hline \hline
+\textbf{256}  & 24.55 & 5.89  & 40.7 & 2 & 4   \\ \hline
+\textbf{512}  & 24.06 & 1.2   & 41.5 & 2 & 2.2 \\ \hline
+\textbf{1024} & 24.09 & 0     & 41.5 & 2 & 1.9 \\ \hline
+\textbf{2048} & 24.03 & 0     & 41.2 & 2 & 1   \\ \hline
+\end{tabular}
+\caption{Result of Apache ab benchmark with 1 million requests and 100 concurrent connections.}
+\label{tab:ab1}
+\end{table}
+
+
+\subsection{Dynamic Queue Size}
+We implement the idea of adjustable queue side, by setting the low\_watermark to
+be queue depth of 128, and high water\_mark is configured between 256 to 2048, using
+ethtool -G. The mlx5 driver initializes its RXQ only to the low\_watermark.
+When the mlx5 napi poll function detects in busy state, it refills the
+RXQ to its high watermark. Otherwise if napi poll is in interrupt state, the driver
+doesn't refill at all if the current available buffers in the RXQ is higher than
+the low\_watermark. In interrupt mode, we only refill when available buffers in the RXQ
+is lower than the low\_watermark.
+
+Table~\ref{tab:ab2} shows the results.
+\begin{table}[h!]
+\centering
+\footnotesize
+\begin{tabular}{|p{0.6cm}|p{1.2cm}|p{1.2cm}|p{1.2cm}|p{0.8cm}|p{1cm}|} \hline
+\textbf{} & \textbf{Time to complete (sec)} & \textbf{out of buffers (K)} & \textbf{Requests / sec (K)} & \textbf{Conn Time (ms)} & \textbf{Conn Time SD} \\ \hline \hline
+\textbf{256}  & 24.6  & 22   & 40.1 & 2 & 9.6 \\ \hline
+\textbf{512}  & 24.1  & 2.1  & 41.3 & 2 & 2.9 \\ \hline
+\textbf{1024} & 24.2  & 65   & 41.2 & 2 & 2   \\ \hline
+\textbf{2048} & 23.9  & 95   & 41.7 & 2 & 1.8 \\ \hline
+\end{tabular}
+\caption{Result of Apache ab benchmark with 1 million requests and 100 concurrent connections.}
+\label{tab:ab2}
+\end{table}
+
+Compared Table~\ref{tab:ab2} with Table~\ref{tab:ab1}, the dynamic queue size shows noticeable
+performance difference. We first observe that even with queue depth high\_watermark set to 2048,
+we still see several packets drop. This is due to the driver initializes only at low\_watermark,
+so the first burst of traffic definitely triggers out of buffer drops.
+In addition, although the total time to complete and the average connection time are almost the
+same, the jittering (SD) is much higher due to more packets being dropped and retransmission.
+
 \subsection{Devlink Interface}
 
-\section{Implementation}
-Most of the network device drivers with representor supports chooses the shared
-RX Queue with service netdev design, which saves memory at the price of possible
-fairness limitation. Table~\ref{table:summary} show a summary of 
 
-\begin{tabular}{|c|c|} \hline
-     Driver &  Implementation\\ \hline \hline
-     Intel ICE & Shared PF/Uplink~\cite{icepatch} \\ \hline
-     Broadcom BNXT & Shared PF/Uplink ~\cite{survey} \\ \hline
-     Netronome NFP & Shared PF/Uplink~\cite{survey} \\ \hline
-     Solarflare SFC &  Shared PF/Uplink~\cite{survey} \\ \hline
-     Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
-     Nvidia MLX5 & Dedicated repr netdevs \\ \hline
-\end{tabular}
 
 \section{Conclusion}
 Scaling to thousands of netdevs is challenging.

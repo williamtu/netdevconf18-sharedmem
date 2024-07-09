@@ -1,4 +1,38 @@
-\section{OVS Script} \label{sec:bash_script}
+\section{Scripts} \label{sec:bash_script}
+
+\begin{lstlisting}[language=sh, caption={SF-representor setup on BlueField}, label={lst:sf}]
+#!/bin/bash
+#ethtool --set-priv-flags p0 rx_striding_rq off
+for i in {100..200}; do
+    devlink port add pci/0000:08:00.0 flavour pcisf pfnum 0 sfnum $i
+done
+for i in {100..200}; do
+    ethtool -L $dev combined 1
+    ethtool -G $dev rx 1024
+    ip link set dev $dev up
+done	
+#optional: create SF
+# devlink port function set $dev state active
+# devlink dev param set auxiliary/mlx5_core.sf.$i name enable_eth value 1 cmode driverinit
+# devlink dev reload auxiliary/mlx5_core.sf.$i
+\end{lstlisting}
+
+\begin{lstlisting}[language=sh, caption={Collect page\_pool usage on BlueField}, label={lst:bash_script}]
+$ ./tools/net/ynl/cli.py --spec Documentation/netlink/specs/netdev.yaml  --dump page-pool-get
+[{'id': 673,
+  'ifindex': 120,
+  'inflight': 512, // 512 pages used for 1024 RXQ depth
+  'inflight-mem': 2097152, // about 2MB
+  'napi-id': 1179}, // each RXQ has its own NAPI-ID
+ {'id': 674,
+  'ifindex': 122,
+  'inflight': 512,
+  'inflight-mem': 2097152,
+  'napi-id': 1180},
+  ...
+\end{lstlisting}
+
+\subsection{OVS}
 \begin{lstlisting}[language=sh, caption={Bash Script for Database Backup}, label={lst:bash_script}]
 #!/bin/bash
 
