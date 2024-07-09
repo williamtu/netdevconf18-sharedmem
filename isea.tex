@@ -14,6 +14,7 @@
 \usepackage{amsmath}
 \usepackage{array}
 \usepackage{tabularx} % Required for adjustable-width tables
+\usepackage{booktabs}
 
 \definecolor{codegreen}{rgb}{0,0.6,0}
 \definecolor{codegray}{rgb}{0.5,0.5,0.5}
@@ -355,6 +356,9 @@ of receive memory buffer, which leads to fair share of bandwidth.
 With that in mind, we describe three designs: A. Shared RXQ of PF,
 B. Adjustable RXQ with share page pool, and C. Shared RXQ with hardware meters.
 
+\subsection{A. Dedicated RXQ}
+
+
 %At high level: Share RX Queue or not
 %Shared RX queue saves memory but fairness
 %Not sharing uses too much memory
@@ -580,6 +584,30 @@ Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
 \label{tab:vendors}
 \end{table}
 
+\subsection{New Devlink Eswitch Attribte: spool}
+Given the fairness issue, we'd like to propose a new devlink eswitch attribute
+for users to enable or disable the Shared RXQ of PF.
+When memory is a precious resources such as SmartNIC or DPU, enabling the Shared RXQ
+saves the most memory as it only uses the RXQ from the PF. And the memory consumption
+does not grow linearly as the number of representors grows.
+On the other hand, if users worry about potencial fairness issue or malicious users,
+then disabling shared RXQ and fallback to the dedicated RXQ can solve the problem.
+Below is the proposed devlink UAPI example~\cite{spool}:
+
+The attribute supports only in switchdev mode.
+\begin{verbatim}
+$ devlink dev eswitch set pci/0000:08:00.0 \
+   mode switchdev spool enable
+$ devlink dev eswitch show pci/0000:08:00.0
+   pci/0000:08:00.0: mode legacy \
+   inline-mode none encap-mode basic \
+   spool enable
+$ devlink dev eswitch set pci/0000:08:00.0 \
+   mode switchdev spool disable
+\end{verbatim}
+
+With this, existing drivers will need to consider supporting both
+modes, shared RXQ mode or dedicated mode. (Or return -ENOSUPP).
 
 \section{Performance Evaluation}
 We conduct our experiment with two servers connected back-to-back using
@@ -688,7 +716,33 @@ so the first burst of traffic definitely triggers out of buffer drops.
 In addition, although the total time to complete and the average connection time are almost the
 same, the jittering (SD) is much higher due to more packets being dropped and retransmission.
 
-\subsection{Devlink Interface}
+
+Finally, we compare 20 seconds tcp single connection performance using iperf3 in Table~\ref{tab:iperf}. 
+The dynamic queue size design performs almost the same, with the worst case of
+dropping around 8\% when queue size is 2048.
+Note that all the experiments are done by disabling the hardware offload.
+When enabling hardware offload, most of the traffic are processed in hardware and
+we're not able to see any performance difference.
+In conclusion, we feel that the performance impact will be even smaller in production
+environment when hardware offload is always enabled.
+
+\begin{table}[h!]
+\centering
+\footnotesize
+\begin{tabular}{|l|c|c|}
+\hline
+%\textbf{} & \multicolumn{2}{|c|}{\textbf{Test Time: 20s}} \\ \hline
+\textbf{} & \textbf{BW Gbps (Static)} & \textbf{BW Gbps (Dynamic)} \\ \hline
+\textbf{64}   & 3.78 & 2.71 \\ \hline
+\textbf{128}  & 5.23 & 5.19 \\ \hline
+\textbf{256}  & 6.03 & 6.15 \\ \hline
+\textbf{512}  & 6.25 & 6.40  \\ \hline
+\textbf{1024} & 6.08 & 5.79 \\ \hline
+\textbf{2048} & 6.03 & 5.49 \\ \hline
+\end{tabular}
+\caption{TCP bandwidth comparison of static queue size v.s dynamic queue size, with HW offload disabled.}
+\label{tab:iperf}
+\end{table}
 
 
 
