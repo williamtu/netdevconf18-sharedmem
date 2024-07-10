@@ -39,9 +39,8 @@ $ ab -c100 -l -n 1000000 -k -l http://10.1.1.1/
 $ iperf3 -t20 -i2 -c 10.1.1.1
 \end{lstlisting}
 
-\begin{lstlisting}[language=sh, caption={Bash Script for Database Backup}, label={lst:bash_script}]
+\begin{lstlisting}[language=sh, caption={DPDK-pktgen consumes all RXQ}, label={lst:fairness}]
 #!/bin/bash
-
 # similar setup for Linux bridge, but disable HW offload by setting aging=0
 PF1=eth2
 VFREP1=eth4
@@ -50,76 +49,44 @@ VF1=eth6
 VF2=eth7
 NS1=ns1
 NS2=ns2
-NS3=ns3
-NS4=ns4
-SF1=enp8s0f0s88
-SF2=enp8s0f0s99
-SFREP1=en8f0pf0sf88
-SFREP2=en8f0pf0sf99
-
 setup_dev_ns()
 {
         ns=$1
         vfdev=$2
         ip=$3
-
         ip netns del $ns || true
         ip netns add $ns
         ip link set dev $vfdev netns $ns
         ip netns exec $ns ifconfig $vfdev ${ip}/24 up
-        ip netns exec $ns iperf3 -s  -u -D
-        ip netns exec $ns iperf3 -s -D
-        ip netns exec $ns netserver
 }
-
 test_dpdk()
 {
-        ip netns exec $NS1 bash
-# don't use "--txonly-multi-flow"
-echo 1280 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
-dpdk-testpmd -l 0-3 --socket-mem=512  -a 0000:08:00.2 -- -i --nb-cores=1 --forward-mode=txonly \
+    ip netns exec $NS1 bash
+    echo 1280 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+    dpdk-testpmd -l 0-3 --socket-mem=512  -a 0000:08:00.2 -- -i --nb-cores=1 --forward-mode=txonly \
 --eth-peer=0,b8:3f:d2:ba:65:9e --txpkts=64 --txq=1 --rxq=1 --stats-period=1 --txonly-multi-flow \
 --total-num-mbufs=2048
         exit
 
 }
-
 setup_ovs()
 {
-        /usr/share/openvswitch/scripts/ovs-ctl stop
-        rm -f /etc/openvswitch/conf.db
-
         echo 2 > /sys/class/net/$PF1/device/sriov_numvfs
-        python2 /usr/bin/mlx_fs_dump -d 0000:08:00.0 > /root/net-next/fdb.txt
-        /usr/share/openvswitch/scripts/ovs-ctl start
         ovs-vsctl set Open_vSwitch . other_config:hw-offload=false 
-        # need to restart OVS
+        /usr/share/openvswitch/scripts/ovs-ctl restart
         ovs-vsctl add-br ovsbr0
         ovs-vsctl add-port ovsbr0 $PF1
         ovs-vsctl add-port ovsbr0 $VFREP1
         ovs-vsctl add-port ovsbr0 $VFREP2
-        #ethtool -L $PF1 combined 2 # mlx5e_napi_poll busy=true
-        echo "bring up device" > /dev/kmsg
         ip link set dev $PF1 up
-
-        #ethtool -L $VFREP1 combined 2
         ip link set dev $VFREP1 up
         ip link set dev $VFREP2 up
-
         setup_dev_ns $NS1 $VF1 192.167.111.1
         setup_dev_ns $NS2 $VF2 192.167.111.2
-
-        ip netns exec $NS1 arp -s 192.167.111.2 d2:a0:5f:ad:a4:e4
-        ip netns exec $NS1 ip link set dev eth6 addr 66:0f:91:31:0a:89
-        ip netns exec $NS2 arp -s 192.167.111.1 66:0f:91:31:0a:89
-        ip netns exec $NS2 ip link set dev eth7 addr d2:a0:5f:ad:a4:e4
-        #ip netns exec $NS1 iperf -c 192.167.111.2 -t5 -i1
         ip netns exec $NS1 ping -i .05 -c10 192.167.111.2
         ip netns exec $NS2 ping -i .05 -c10 192.167.111.1
-        ip netns exec $NS1 iperf3 -u -b10G -c 192.167.111.2 -t1 -i1
-        ip netns exec $NS1 iperf3 -c 192.167.111.2 -t2 -i1
 }
-
 devlink dev eswitch set pci/0000:08:00.0 mode switchdev
 setup_ovs
+test_dpdk
 \end{lstlisting}

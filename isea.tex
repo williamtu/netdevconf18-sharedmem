@@ -45,7 +45,9 @@
 \pdfinfo{
 /Title (Shared Memory Pool for Representors)
 /Author (Netdev Conference 0x18, 2024)}
+
 % The file isea.sty is the style file for ISEA 2015 proceedings.
+
 % reference: epoll paper: Busy Polling: Past, Present, Future
 % https://netdevconf.info/2.1/papers/BusyPollingNextGen.pdf
 % reference: ./Documentation/networking/representors.rst
@@ -200,11 +202,10 @@ We welcome anyone to review and correct any content in any format (PR, or email 
 \begin{figure}[t!]
 \includegraphics[width=3.2in]{arch.pdf}
 \caption{The fast and slow path model. The switchdev in NIC is the fast path handling
-hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic.}
+hardware offloaded traffic among VFs/SFs, and the DPU which contains representor (repr) netdevs and software switch handles the slow path traffic. The slow-path can be
+either in Host, or be part of the NIC.}
 \label{fig:arch}
 \end{figure}
-
-
 
 %This post an important question: how much memory buffer does a representor
 %netdev needs to pre-allocate for bursty traffic?
@@ -226,7 +227,6 @@ We should that by sharing the memory
 \fi
 
 \section{Background}
-
 \subsection{Eswitch and Switchdev Mode}
 An eSwitch, or embedded switch, is a hardware component within modern network
 controllers, such as the Intel Ethernet Controller E810. It is also known as
@@ -346,164 +346,178 @@ queue by re-allocating new buffer.}
 
 \section{Design}
 % table here shows existing driver's implementation~\cite{buffersize}
-We'd like to support 1K of SFs/VFs with representor netdevs
-on DPU, with the following requirements: 1) 1k netdev creation time
+With the goal of supporting 1K of SFs/VFs with representor netdevs
+on DPU, we set the following requirements: 1) 1k netdevs creation time
 around 10 minutes, including configurations and bringing the device up,
 2) memory consumption of DPU or host system is within
 system limit, and 3) all the VFs/SFs representor get fair share
 of receive memory buffer, which leads to fair share of bandwidth.
-
-With that in mind, we describe three designs: A. Shared RXQ of PF,
-B. Adjustable RXQ with share page pool, and C. Shared RXQ with hardware meters.
+The following subsections presents four designs: A. Dedicated RXQ,
+B. Shared RXQ of PF, C. Adjustable RXQ with shared memory pool, and
+D. Shared RXQ with hardware meters.
 
 \subsection{A. Dedicated RXQ}
+This design is the default design with minimal or no change.
+Dedicated RXQ is used in previous version of Intel ICE before patch~\cite{icepatch}
+and also the current version of Marvell Octeontx2~\cite{octeontx2}.
+In this design, each representor has its own RXQ, and do not share its
+RXQ with any other representors. The design guarantees performance isolation
+between representors, but the downsides are that it 1) consumes
+lots of RXQ memory in the system, and 2) some NIC hardware has limitation of
+how many hardware RX queues it can create. For example, Intel ICE can create up to
+1k queues. If users want to use more than 1k representors, there is not
+enough queues to assign to each representor netdev.
 
-
-%At high level: Share RX Queue or not
-%Shared RX queue saves memory but fairness
-%Not sharing uses too much memory
-\subsection{A. Shared RXQ of PF}
-% pros: assumption: not all send at the same time
+\subsection{B. Shared RXQ of PF}
 
 \begin{figure}[t!]
 \includegraphics[width=2in]{design1.pdf}
 \centering
-\caption{Shared RX Queue: A PF/uplink-representor netdev receieves all slow-path traffic
-for other representors, and reconstructs their skb and passes to upper
-network stacks.}
-\label{fig:arch}
+\caption{Shared RXQ Design: A PF or uplink-representor netdev receives all
+slow-path traffic for other representors, and reconstructs their skb
+and passes to upper network stacks.}
+\label{fig:sharedrxq}
 \end{figure}
-
-The assumption of the design is that not all send at the same time.
-
 Since the representor netdev only handles the miss traffic or first
-few packets for connection setup, existing solution is to assign a
-a dedicated service netdev for handling \emph{all} traffic from other
-representors. This dedicated service netdev acts like an intermedia
-multiplex layer, it sees all slow path traffic from all the
-reprensentors, and lookup an internal data structure to identify the
-orignal source of VF/SF, reconstruct the skb->dev to the correct
-orignal netdev, and pass up kernel stack. As a result, the representor
-netdev no longer sees packets and no need to allocate RX queue.
+few packets for connection setup, one solution is to aggregate all
+slow-path traffic from all representor netdevs into a single one,
+usually the PF representor or the uplink representor netdev.
+The PF representor acts like an intermediate multiplex layer, and 
+it sees all slow path traffic from all other reprensentors.
+When packets arrive, it looks up an internal data structure to identify the
+original vport id of VF/SF, reconstructs the skb->dev to the correct
+orignal netdev, and passes up kernel stack. As a result, the
+non-PF or non-uplink representor netdev no longer sees packets
+and no need to allocate RX queue, as shown in Figure~\ref{fig:sharedrxq}.
 
-Service netdev can be any netdev, but commonly used are PF or the uplink
-representor netdev. For Intel ICE driver, PF is used to receive all other
-reprensetor's traffic.
-Different vendors have different design, but in general, the device
-driver needs to do the following:
-
+This design saves huge amount of memory because most of the representors'
+RX functions are avoided, with all representors' traffic using PF representor
+netdev's RXQs. In the case of ICE driver, even the TX
+function of the representors are handled by PF representor, making other
+representors purely a control/management interfaces.
+Different vendors have different implementation, but in general,
+the device driver needs to do the following:
 %Recall that in Figure~\ref{fig:pipe} the representor and vport are like pipe.
 \begin{itemize}
-\item RX hardware steering: instead of sending slow-path traffic to
-each individual representors, the NIC needs to steer/redirect all
-slow-path traffic to the service netdev, and mark the packet's orignal
-vport information, vport\_id, in metadata or packet buffer.
-\item RX software: the service netdev now sees all traffic including
+\item RX Hardware Steering: instead of sending slow-path traffic to
+each individual representors, the NIC needs to steers/redirects all
+slow-path traffic to the PF representor netdev, and mark the packet with
+its original vport information, e.g., vport\_id, in metadata or packet buffer.
+\item RX in Driver: the PF representor netdev sees all traffic including
 others arriving at its RX queues. It needs to keeps a map of vport\_id
 to the packet's original netdev struct. By extracting the vport\_id
-from metadata, the orignal netdev is restored to sk\_buff and continue
-kernel network stack. The representor netdev no longer allocates memory
-for RX queues and buffers.
-%it is able to distinguish which vport the packet
-\item TX: because the vport and representor act like a pipe, the service
-netdev need to know which vport's RX queue the packet should be \emph{send}
-to. Drivers can use the dst\_entry of skb, or other per-packet metadata
-field, and rely on internal switch to deliver the packet to the vport.
+from metadata, the original netdev is restored to sk\_buff and continue
+kernel network stack.
+\item TX in Driver: because the vport and representor act like a pipe,
+the PF representor netdev need to know which vport's RX queue the packet
+should be \emph{send} to. Drivers can use the dst\_entry of skb, or other
+per-packet metadata field, and rely on internal switch to deliver the
+packet to the vport.
 \end{itemize}
 
-\emph{pros and cons:}
-The shared rx queue solution saves lots of memory by redirecting
-all traffic to service netdev, because it consumes only one service
+\textbf{Pros and Cons:}
+Although this design saves lots of memory by redirecting all traffic to
+PF representor netdev, users need to tune the following two parameters:
+because it consumes only one service
 netdev's memory. Depending on number of SF/VFs and traffic volume,
 users need to configure two parameters of service netdev:
 \begin{itemize}
-    \item the number of RX queues should increase to decrease the chance
-    of multiple flows from multiple vports rxhash to the same queue.
-    (ethtool -L combined) Today, the max RX queue is usually limited by
-    number of CPUs.
+    \item the number of RXQs should increase to decrease the chance
+    of multiple flows from multiple vports rxhash to the same queue,
+    e.g., using ethtool -L combined. Most of the drivers limit its max number
+    of RXQs to the number of CPUs.
     \item the RX queue depth should increase to absorb more traffic
-    burst from multiple vports. (ethtool -G rx)
-    \item reduce the NAPI schedule delay, which means napi can process
-    packets as soon as possible when packets arrived, can reduce the queue
-    depth grows to fast. (I don't know any tool to do this)
+    burst from multiple vports, e.g., using ethtool -G rx. However, this might
+    increase the packet processing latency.
+    \item Reduce the NAPI schedule delay, which means NAPI can process
+    packets as soon as possible when packets arrived. This lowers the chance
+    of RXQ utilization grows to fast or overflow. (I don't know any tool to do this).
 \end{itemize}
 
 The design is simple to implement, but we found that it suffers from
-a fairness issue. A single high volume sender, ex: dpdk-pktgen,
-sending to its vport and arrives at slow path, can easily consume all
-the buffers in the service netdev's RX queue, making other representor's
-traffic being dropped. An example setup script to show case the issue
-using OVS and Linux bridge is provided in Appendix.
+a \emph{fairness} issue. A single high volume sender, ex: dpdk-pktgen,
+sending to its vport and with packets arriving at slow path, can easily
+consume all the buffers in the PF representor netdev's RXQ.
+And because all other representors share the same PF's RXQ, this makes
+other representor and its vport traffic being dropped due to no
+available RX buffer at all. An example setup script to show case the issue
+using OVS is provided in Listing~\ref{lst:fairness}.
 
-\subsection{B-1. Adjustable RXQ}
-Since sharing the RX Queues of PF or uplink representor suffers fairness
-issue, another solution is to {\em not} sharing the RX queue. That is, each
-representor acts like a regular netdevs, with its own RX queues and RX buffers.
+\subsection{C-1. Adjustable RXQ Depth}
+If the shared RXQ of PF suffers from fairness issue, another solution is to
+{\em not} sharing the RXQ, but think about other ways to save memory.
+For every RXQ in every netdev, existing network drivers implement \emph{static}
+RXQ allocation.  Whenever a driver initializes, it always pre-allocates the number
+of buffers to the full RXQ depth, and whenever a batch of packets arrived and
+processed by NAPI poll, device driver again refills to full by re-allocating
+buffers to the \emph{full} RXQ depth.
 
-To save memory, for every queue in every netdev, instead of doing the
-static RX queue allocation, which always allocating to \emph{full} RX queue
-depth, we propose to dynamically adjust RX queue.
-For example, an mlx5 driver, by default, always tries to allocate to
-full 1024 rxq buffers. Instead, the following logic is applied when
-a driver is receiving packets in its NAPI context:
+To save memory, instead, the adjustable RXQ depth does not refill to full
+RXQ depth, but only to a threshold value, called low\_watermark.
+For example, the mlx5 driver, by default, always tries to allocate to
+full 1024 rxq buffers. With adjustable RXQ, the following logic is applied
+when a driver is receiving packets in its NAPI context:
 \begin{itemize}
-    \item NAPI busy: allocate buffers and refill to full queue depth.
+    \item NAPI busy: allocate buffers and refill to full queue depth, high\_watermark.
+    The high\_watermark equals the max RXQ depth set by ethtool -G rx.
     \item NAPI interrupt: allocate buffers and refill to low watermark if
-    current queue depth is lower than low watermark
-    \item NAPI interrupt: do not allocate and refill if current queue
-    depth is higher than low\_watermark.
+    current RXQ depth is lower than low watermark
+    \item NAPI interrupt: do not allocate and do not refill if current
+    RXQ depth is higher than low\_watermark.
 \end{itemize}
 
+\textbf{Pros and Cons: }
 We set the low\_watermark to be 128 (2 * NAPI\_BUDGET). 
-The low\_watermark means the minimal available buffers to handle the
+The low\_watermark means the minimal available RXQ buffers to handle the
 worst case of traffic burst. At driver initialization time, all queues
 are allocated only up-to the low\_watermark. Once the first burst
 of traffic arrives, users might see more packets dropped compared
 to full rxq depth allocation (1024). Fortunately, a NAPI busy state will
-trigger driver to refill to its full rxq depth, making the performance
+trigger driver to refill RXQ to its full depth, making the performance
 impact minimal. In this design, we pay the performance price to save
-memory. The first burst traffic of a connection see more packets dropped,
-and once in NAPI-busy, the driver acts the same as static RX queue
-allocation.
+memory. The first burst traffic of a connection definitely see more
+packets dropped, and once in NAPI-busy, the driver acts the same as
+static RX queue allocation.
 
-The high\_watermark is the max RX queue depth, which is the same value
-set in static allocation, the rxq depth set by (ethtool -G rx)
+%The high\_watermark is the max RX queue depth, which is the same value
+%set in static allocation, the rxq depth set by (ethtool -G rx)
+Such a design saves memory at driver initialization, as well as when at
+the NAPI-interrupt state, device driver will slowly return RXQ buffers back
+to kernel due to packet arrives but driver does not re-allocate.
+However, what if an RXQ is in NAPI-interrupt state, but there is no packet
+arrived to trigger returning buffers to system? Then driver needs to detect
+and drain the RX queue back to the low\_watermark.
 
-Such a design saves memory at driver initialization, as well as the
-NAPI-interrupt
-state will slowly return page back to kernel due to packet arrives but
-driver does not allocate and refill. However, what if an rxq is in
-NAPI-interrupt, but there is no packet arrived to trigger returning
-pages to system? Then driver needs to detect and drain the RX queue
-back to the low\_watermark.
-
-\textit{pros and cons:} 
+We implement this prototype and evaluate its impact in performance evaluation section.
 
 \begin{figure}[t!]
-\includegraphics[width=2.6in]{shared_page_pool.pdf}
+\includegraphics[width=2.8in]{shared_page_pool.pdf}
 \centering
 \caption{The adjustable RX queues with shared page pool allows multiple}
 \label{fig:shared_page_pool}
 \end{figure}
 
-\subsection{B-2. Adjustable RXQ with Shared Page Pool}
-Currently each queue creates its own kernel page pool, and in NAPI, refilling
-the RXQ buffer by getting a page pool entry from its own per-queue page pool.
+\subsection{C-2. Adjustable RXQ Depth with Shared Page Pool}
+% TODO: limitation, single NIC DMA device, or how about virtual devices such as multiple veth?
+We found that the memory savings with the design of adjustable RXQ depth
+might not be enough.
+Currently each RXQ creates its own kernel page pool, and in NAPI, refilling
+the RXQ buffers by allocating a page pool entry from its own per-queue page pool.
 When scaling to thousands of representor netdevs, there is no guarantee that
-all the representor netdev gets fair share of system memory. That is, the late
-coming netdevs might see system out-of-memory for initializing its RXQ ,
-even with the Adjustable RX Qeueue design.
+all the representor netdev gets fair shares of system memory. That is, the later
+created representor netdevs might see system out-of-memory for initializing its RXQ,
+even with the Adjustable RXQ Depth design.
 
 We propose shared page pool, a layer of page pool that runs on top of current
 Linux page pool APIs. The shared page pool supports for a group of netdevs
-to register as user, and the shared memory pool fairly allocate memory for
-each users based on the its current usage and total available memory in
-the pool.
+to register as user, request buffers to use in its RXQs, and the shared memory
+pool fairly allocate memory for each user based on the its current usage and
+total available memory in the pool.
 
 Figure~\ref{fig:shared_page_pool} shows the idea.
-Assume N representor netdevs, each has one rxq. In the beginning, a special
-netdev, PF or uplink representor, creates the shared page pool, and join
-itself into the pool. The netdevs created later join the shared page pool,
+Assume N representor netdevs, with each has one RXQ. In the beginning,
+a special netdev, PF or uplink representor, creates the shared page pool,
+and join itself into the pool. The rest of netdevs created later join the shared page pool,
 by registering itself to the pool, call the alloc and free API to
 get or put the page into shared pool. We assume \emph{no lock} is required,
 by creating the shared page pool per-CPU NAPI context, which NAPI scheduler
@@ -564,26 +578,28 @@ Another approach to solve the fairness and memory issue is to seek for hardware
 support. This design uses the shared page pool for multiple representor netdevs,
 but instead of changing 
 
-\section{Implementation}
-Most of the network device drivers with representor chooses the shared
-RX Queue design, which saves memory at the price of possible
-fairness limitation. Table~\ref{tab:vendors} show a summary of 
 \begin{table}[h!]
 \centering
 \footnotesize
-\begin{tabular}{|l|l|} \hline
+\begin{tabular}{|l|p{3.6cm}|} \hline
 \textbf{Driver} &  \textbf{Implementation}\\ \hline \hline
-Nvidia MLX5 & Dedicated repr netdevs \\ \hline
+Nvidia MLX5 & Shared RXQ of PF and \newline Adjustable RXQ \\ \hline
 Intel ICE & Shared RXQ of PF~\cite{icepatch} \\ \hline
 Broadcom BNXT & Shared RXQ of PF ~\cite{survey} \\ \hline
 Netronome NFP & Shared RXQ of PF~\cite{survey} \\ \hline
 Solarflare SFC &  Shared RXQ of PF~\cite{survey} \\ \hline
 Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
 \end{tabular}
-\caption{Memory consumption of a SF-repr and its breakdown of page pool and Firmware usage.}
+\caption{Summary of existing network drivers and its representor solution.}
 \label{tab:vendors}
 \end{table}
 
+\section{Implementation}
+Most of the network device drivers with representor chooses the shared
+RX Queue design, which saves memory at the price of possible
+fairness limitation. Table~\ref{tab:vendors} show a summary of 
+
+We 
 \subsection{New Devlink Eswitch Attribte: spool}
 Given the fairness issue, we'd like to propose a new devlink eswitch attribute
 for users to enable or disable the Shared RXQ of PF.
@@ -610,12 +626,6 @@ With this, existing drivers will need to consider supporting both
 modes, shared RXQ mode or dedicated mode. (Or return -ENOSUPP).
 
 \section{Performance Evaluation}
-\begin{figure}[t!]
-\includegraphics[width=2.6in]{testbed.pdf}
-\centering
-\caption{Back-to-back}
-\label{fig:testbed}
-\end{figure}
 
 We conduct our experiment with two servers connected back-to-back using
 two x86 host, shown in Figure~\ref{fig:testbed}.
@@ -637,6 +647,12 @@ memory, and among the 2.86MB, 1.83 is consumed by page pool for the RXQ buffers,
 around 0.11MB is consumed by firmware, and the rest of 0.9MB is for others
 such as slab, ex: kmalloc, kzalloc, and other kernel netdev structures.
 When increase from 1 RXQ to 2 RXQs, the memory consumption also increases linearly, as expected.
+\begin{figure}[t!]
+\includegraphics[width=3.2in]{testbed.pdf}
+\centering
+\caption{Back-to-back setup with x86 host and ARM DPU for performance evaluation.}
+\label{fig:testbed}
+\end{figure}
 
 \begin{table}[h!]
 \centering
