@@ -78,19 +78,20 @@ NetDev 0x18, CA, USA, July 15th-19th, 2024
 Representor is a special object that controls the slow path of
 switchdev virtual port, or vport (the representee). 
 %It configures administratively of the virtual port, as well as provides the slow path for traffic which does not hit any offloaded fast-path rules in the switchdev.
-When scaling to thousands of vports, a corresponding thousands of
-representor netdevs are created, usually one vport has one representor
-netdev. With modern NICs equipped with advanced offload capabilities
-and increasing flow tale size, the representor netdevs usually
-processes only the first couple of packets
-from a new connection, and insert rules into the NIC hardware so
-subsequent packets are processed in hardware.
-
-Creating thousands of representor netdevs becomes resource heavy,
+When scaling to thousands of vports,
+a corresponding thousands of
+representor netdevs are created
+%, usually one vport has one representor
+%netdev. With modern NICs equipped with advanced offload capabilities
+%and increasing flow tale size, the representor netdevs usually
+%processes only the first couple of packets
+%from a new connection, and insert rules into the NIC hardware so
+%subsequent packets are processed in hardware.
+and thousands of representor netdevs becomes resource heavy,
 especially for SmartNICs or DPUs (Data Processing Unit).
 An Nvidia Bluefield-2 contains 16GB of memory, but creating one
 thousand representor netdevs can use more than 10GB of RX memory buffer.
-Existing solutions save memory by sharing the RXQs of a PF (Physical Function) among
+Existing solutions save memory by sharing the RXQs of a Physical Function among
 all other reprensetors. However, this approach suffers from unfairness:
 a single VM can easily monopolize all RXQs, causing no RX buffers
 available for other VMs.
@@ -98,6 +99,9 @@ The paper proposes a design with adjustable RXQ depth using a shared page pool.
 Our result shows that we can save 50\% of memory with less than 10\% of
 performance impact.
 \end{abstract}
+
+\section{Keywords}
+SmartNIC/DPU, Switchdev, Page Pool, Receive Queues
 
 \iffalse
 \begin{figure}[h]
@@ -237,9 +241,9 @@ We should that by sharing the memory
 \section{Background}
 \subsection{Eswitch and Switchdev Mode}
 An eSwitch, or embedded switch, is a hardware component within modern network
-controllers, such as the Intel Ethernet Controller E810. It is also known as
-a Virtual Ethernet Bridge (VEB). The eSwitch is managed by the Physical Function (PF)
-driver of the Ethernet or in the case of SmartNIC, managed by the ECPF (Embedded
+controllers, also known as a Virtual Ethernet Bridge (VEB). The eSwitch is managed
+by the Physical Function (PF) driver of the Ethernet or in the case of SmartNIC,
+managed by the ECPF (Embedded
 CPU's PF) that runs in the smartNIC's core. Eswitch can operate in two modes:
 Legacy mode and Switchdev mode.
 
@@ -251,7 +255,7 @@ capabilities of the E-Switch to hardware. In switchdev mode, more switching
 rules and logic can be offloaded to the hardware switch ASIC, for example
 push and pop tunneling protocol, connection tracking, etc.
 The switchdev mode requires a slow path, software switch such as OVS or
-Linux bridge, and representor netdevices that handle miss traffic.
+Linux bridge, and representor netdevs that handle miss traffic.
 The slow-path handles flows that can not be offloaded or miss the hardware
 flow table lookup from the VFs/SFs.
 % $$:`Documentation/networking/switchdev.rst <switchdev>` and
@@ -271,12 +275,12 @@ received by the representor netdev, if it fails to match any offload rule (left)
 
 \subsection{Representors}
 A vport can be PFs (used by administrator), or VFs or SFs (assigned to VMs
-or containers). When the hardware offload table is empty, all packets are 
-processed by the slow path. Representor netdev and vport are like a linux
-pipe, shown in Figure~\ref{fig:pipe}. Packets transmitted by the representor
-netdev from DPU are delivered to its vport; packets transmitted by the vport
-from VM are received by the representor netdev, if it fails to match any
-offload rule.
+or containers). When the hardware offload table is empty or disabled, all packets are 
+processed by the slow path. Representor netdev and vport work as a pair and are like a
+pipe, as shown in Figure~\ref{fig:pipe}. Packets transmitted by the representor
+netdev from slow-path DPU are delivered to its vport in fast-path;
+packets transmitted by the vport from VM are received by the representor netdev,
+if it fails to match any offload rule.
 
 % an end-to-end example
 For example in Figure~\ref{fig:arch}, VM1 would like to setup a new TCP
@@ -295,51 +299,49 @@ in subsequent packet processing.
 
 Note that the behavior of the slow-path (representor ports and software
 switch) should be the same as fast-path (vports and switchdev).
-And because representor and vport are acting like pipe, an OpenFlow
-rule on a representor netdev applies to a packet on its
+And because representor and vport are acting like pipe, a network policy
+rule such as OpenFlow on a representor netdev applies to a packet on its
 receive path is the same as it applies on vport's transmit path.
-
 
 \subsection{Buffer Pre-allocation for RX Queue}
 Network device drivers pre-allocate a circular buffers for absorbing the
 burstness of network traffic.
-Once packets arrive, NIC can DMA a batch of packets into these pre-allocated buffers,
+Once packets arrive, NIC DMAs a batch of packets into these pre-allocated buffers,
 potentially hundreds of them, before the host CPU is notified/kicked in
 by interrupts to process these packets.
-For performance reason, NIC contains multiple queues with each queue
+For performance reason, NIC contains multiple RX queues with each queue
 represents an NAPI context and an IRQ to kick in to process rx packet.
 Usually the number of RX queues is the same as number of CPU that involves
 in packet processing.
-As shown in Figure~\ref{fig:rxq}, each RX queue contains several entries, 
-or queue depth, with each entries
-point to a packet buffer. So the amount of pre-allocated memory for RX
+As shown in Figure~\ref{fig:rxq}, each RXQ is a circular buffers
+contains several entries, with each entries
+point to a packet buffer. So the amount of pre-allocated memory for RXQ
 is a product of buffer size * number of queues * queue depth.
-A typical example of a data center server with 64 cores would be:
-4k * 64 queues * 1k entries = 256MB, for a single 64-rxq netdev.
+A typical example of a data center server with 64 cores would consume memory of:
+4k * 64 queues * 1k entries = 256MB, for a single netdev.
 
-Note that the queue depth, or the number of entries in RX queue, is
-not only for tolerating the burstness of traffic, but also the CPU
-processing time/jitter of a packet. When CPU is under heavy loading,
+Larger RXQ depth, or more entries in RXQ, has many benefits.
+It helps not only for tolerating the burstness of traffic, but also
+the CPU processing time/jitter of a packet. When CPU is under heavy loading,
 a packet arriving RX interrupt might not be able to immediately
-kick in the CPU to process packets. Thus a deeper queue depth can
-avoid packets being dropped.
+kick in the CPU to process packets.
 In addition, each packet usually has different processing time.
 The time for CPU to process a TLS packet is definitely longer than
-an ARP packet. Thus, a deeper RX queue also helps avoiding packets
+an ARP packet. Thus, a deeper RXQ also helps avoiding packets
 dropped due to intermittently longer packet processing time.
 
 However, memory is not cheap, especially when scaling to 1K devices
-and with 1k representor netdevs in DPU. And having several GBs of
+and with 1k representor netdevs in DPU. And reserving several GBs of
 pre-allocated memory idle just waiting for a burst of traffic
 or even unused when the low traffic volume is a huge resource waste.
-We discuss different solutions in later section.
+We discuss different solutions in later sections.
 
 \begin{figure}[t!]
 \includegraphics[width=3.0in]{rxq.pdf}
 \centering
 \caption{Network driver allocates buffers to fill its RX queue. NIC DMA packet
 payload into the buffers and NAPI rx function process the packet, refill the 
-queue by re-allocating new buffer.}
+queue by re-allocating new buffers.}
 \label{fig:rxq}
 \end{figure}
 
@@ -639,9 +641,11 @@ Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
 
 \section{Implementation}
 Most of the network device drivers with representor implement the shared
-RX Queue design, which saves memory at the price of possible
+RXQ design, which saves memory at the price of possible
 fairness limitation. Table~\ref{tab:vendors} show a summary different
 network device driver's implementation choices.
+For MLX5 driver, we'd like to propose a configuration knobs that turns
+on or off the Shared RXQ, depending on users' choice.
 
 \subsection{New Devlink Eswitch Attribte: spool}
 Given the fairness issue, we'd like to propose a new devlink eswitch attribute
@@ -649,7 +653,7 @@ for users to enable or disable the Shared RXQ of PF.
 When memory is a precious resource such as SmartNIC or DPU, enabling the Shared RXQ
 saves the most memory as it only uses the RXQ from the PF. And the memory consumption
 does not grow linearly as the number of representors grows.
-On the other hand, if users worry about potencial fairness issue or malicious users,
+On the other hand, if users worry about potential fairness issue or malicious users,
 then disabling shared RXQ and fallback to the dedicated RXQ can solve the problem.
 Below is the proposed devlink UAPI example:
 
@@ -674,8 +678,11 @@ We conduct our experiment with two servers connected back-to-back using
 two x86 host, shown in Figure~\ref{fig:testbed}.
 Each host is equipped with one dual port BlueField-2 card.
 Each x86 host consists of 10 cores and 32GB of RAM. The BlueField-2
-is an 8-cores Cortex-A72, with 16GB of RAM. BlueField, by default, runs OVS kernel
-datapath with hardware-offload enabled.
+is an 8-cores Cortex-A72, with 16GB of RAM. BlueField, by default, in 
+production environment, runs OVS kernel datapath with hardware-offload enabled.
+Unless mentioned, we run all experiements with OVS hardware offload \emph{disabled}.
+This forces the traffic to go to slow-path representor netdevs so we can
+easily measure the performance impact.
 
 \subsection{Memory Consumption}
 Linux kernel today provides several memory profiling tool, such as /proc/meminfo,
@@ -746,7 +753,8 @@ being dropped, and lower jittering (SD is smaller).
 \textbf{1024} & 24.09 & 0     & 41.5 & 2 & 1.9 \\ \hline
 \textbf{2048} & 24.03 & 0     & 41.2 & 2 & 1   \\ \hline
 \end{tabular}
-\caption{Result of Apache ab benchmark with 1 million requests and 100 concurrent connections.}
+\caption{Results of Apache ab benchmark with 1 million requests and 100 concurrent
+connections, with OVS hardware offload disabled in DPU.}
 \label{tab:ab1}
 \end{table}
 
@@ -783,7 +791,6 @@ so the first burst of traffic definitely triggers out of buffer drops.
 In addition, although the total time to complete and the average connection time are almost the
 same, the jittering (SD) is much higher due to more packets being dropped and retransmission.
 
-
 Finally, we compare 20 seconds tcp single connection performance using iperf3 in Table~\ref{tab:iperf}. 
 The dynamic queue size design performs almost the same, with the worst case of
 dropping around 8\% when queue size is 2048.
@@ -811,22 +818,43 @@ environment when hardware offload is always enabled.
 \label{tab:iperf}
 \end{table}
 
+%\section{Discussions}
+%\textbf{Lock in shared page pool}:\newline
+%\textbf{Data set to evaluate fairness}:\newline
+%\textbf{A model for slow-path}:
+\section{Related Work}
+Setting the right buffer size is important for network performance.
+The paper~\cite{buffersize} provides a guideline for buffer sizing
+in network routers based on the bandwidth delay product.
+And the paper~\cite{queuelength} proposes buffer management scheme
+called Dynamic Threshold (DT) for shared-memory packet switches.
+Although both papers are designed for hardware switches/routers,
+we found similarities in the case of host networking with switchdev.
+The buffer sizing, or sizing the RXQ depth, is more complicated in host
+network as the packet processing time varies a lot due to CPU workload,
+interrupt delivery/moderation, and vendor driver implementation.
+However, the solution space in host networking is more flexible as
+ideas can be implemented in software in stead of hardware.
 
 
 \section{Conclusion}
-Scaling to thousands of netdevs is challenging.
-
-
+Scaling to thousands of vports with their representor netdevs is challenging,
+especially in the SmartNIC/DPU deployment. The paper shares our experience in
+Nvida BlueField deployment, and examines the existing
+solutions from various device drivers, using shared RXQ of PF, or dedicated
+RXQ. We discuss each design's pros and cons, and propose a new design called
+adjustable RXQ with shared page pool. We conclude that a huge amount of memory can be saved,
+by reducing default RXQ depth from 1024 to 512/256, and the performance impact
+remains very little.
 
 %numbers.\footnote{This is how your footnotes should appear.} Separate them from the text by a short horizontal line. 
 \section{Acknowledgments}
-We'd live to thank many people for their valuable feedbacks, from internally and the community.
-
+We'd live to thank many people for their valuable feedback, from internally
+and the Linux kernel community, including Saeed Mahameed, Jiri Pirko,
+Parav Pandit, Tariq Toukan, Jakub Kicinski, Bodong Wang, Wei Bai, and Dan Jurgens.
 % discussion
 % NAPI budget, net_dim, API
 % why hardware and software TC QOS doesn't work
-
-For technical questions about Microsoft Word formatting please seek online tutorials. For other questions about your manuscript please contact: {\tt ISEA2015-info@sfu.ca}
 
 \bibliographystyle{isea}
 \bibliography{isea}
