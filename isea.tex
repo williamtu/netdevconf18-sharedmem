@@ -15,6 +15,8 @@
 \usepackage{array}
 \usepackage{tabularx} % Required for adjustable-width tables
 \usepackage{booktabs}
+\usepackage{lastpage}
+\usepackage{fancyvrb}
 
 \definecolor{codegreen}{rgb}{0,0.6,0}
 \definecolor{codegray}{rgb}{0.5,0.5,0.5}
@@ -75,28 +77,28 @@ witu@nvidia.com, michal.swiatkowski@intel.com, yossiku@nvidia.com\\
 
 \begin{abstract}
 Representor is a special object that controls the slow path of
-switchdev virtual port (the representee). It configures administratively
-of the virtual port, as well as provides the slow path for traffic which
-does not hit any offloaded fast-path rules in the switchdev.
+switchdev virtual port (the representee). 
+%It configures administratively of the virtual port, as well as provides the slow path for traffic which does not hit any offloaded fast-path rules in the switchdev.
 When scaling to thousands of vports, a corresponding thousands of
 representor netdevs are created, usually one vport has one representor
 netdev. With modern NICs containing advanced offload capabilities
-and increasing flow tale size, the role of representor netdevs becomes
-lightweight but critical. It processes the first couple of packets
+and increasing flow tale size, the representor netdevs usually
+processes the first couple of packets
 from a new connection, and insert into the NIC hardware for
-subsequent packets to hit fast-path rules. 
+subsequent packets to hit fast-path rules.
 
 Creating thousands of representor netdevs becomes resource heavy for
-just handling the connection and offload setup, especially for the SmartNIC or
-DPU (Data Processing Unit). An Nvidia Bluefield-2 contains 16GB
+just handling the connection and offload setup, especially for SmartNICs or
+DPUs (Data Processing Unit). An Nvidia Bluefield-2 contains 16GB
 of memory, but creating one thousand representor netdevs can use
 more than 10GB of RX memory buffer.
-The paper discusses three different solutions, 1) sharing the RX queues
-with a service netdev, 2) dynamically adjusting the RX queue depth,
-and 3) adjusting the RX queue with a fair shared page pool.
-We describe the design of these solutions, their implementations,
-and present some of the performance numbers.
-
+Existing solutions save memory by sharing the RXQs of a PF netdev among
+all other reprensetors. However, this approach suffers from unfairness:
+a single VM can easily monopolize all RXQs of PF, causing no RX buffers
+available for other VMs.
+The paper proposes a design with adjustable RXQ depth using a shared page pool.
+Our result shows that we can save 50\% of memory with less than 10\% of
+performance impact.
 \end{abstract}
 
 \iffalse
@@ -291,15 +293,6 @@ And because representor and vport are acting like pipe, an OpenFlow
 rule on a representor netdev applies to a packet on its
 receive path is the same as it applies on vport's transmit path.
 
-\iffalse
-When the system boots, and before any offload is configured, all packets from
-the virtual functions appear in the networking stack of the PF via the
-representors.
-The PF can configure standard Linux forwarding between representors, the uplink
-or any other netdev (routing, bridging, TC classifiers).
-Thus, a representor is both a control plane object (representing the function in
-administrative commands) and a data plane object (one end of a virtual pipe).
-\fi
 
 \subsection{Buffer Pre-allocation for RX Queue}
 Network device drivers pre-allocate a circular buffers for absorbing the
@@ -526,7 +519,7 @@ the alloc and free API to get or put the page into shared pool.
 %will guarantee not scheduling two NAPIs poll sharing the same pool on
 %different cores.
 We define the following APIs:
-\begin{verbatim}
+\begin{Verbatim}[fontsize=\small]
 # Creates page pool, return the handler
 spp = shared_pp_create(
     max_num_devs, page_pool_size, …);
@@ -546,7 +539,7 @@ shared_pp_put_page(spp, spp_uid1);
 
 #Leave the share page pool
 shared_pp_leave(spp, spp_uid1); 
-\end{verbatim}
+\end{Verbatim}
 
 But how to solve the fairness issue?
 The problem of multiple RXQs sharing a single page pool is
@@ -639,22 +632,23 @@ Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
 \end{table}
 
 \section{Implementation}
-Most of the network device drivers with representor chooses the shared
+Most of the network device drivers with representor implement the shared
 RX Queue design, which saves memory at the price of possible
-fairness limitation. Table~\ref{tab:vendors} show a summary of 
+fairness limitation. Table~\ref{tab:vendors} show a summary different
+network device driver's implementation choices.
 
 \subsection{New Devlink Eswitch Attribte: spool}
 Given the fairness issue, we'd like to propose a new devlink eswitch attribute
 for users to enable or disable the Shared RXQ of PF.
-When memory is a precious resources such as SmartNIC or DPU, enabling the Shared RXQ
+When memory is a precious resource such as SmartNIC or DPU, enabling the Shared RXQ
 saves the most memory as it only uses the RXQ from the PF. And the memory consumption
 does not grow linearly as the number of representors grows.
 On the other hand, if users worry about potencial fairness issue or malicious users,
 then disabling shared RXQ and fallback to the dedicated RXQ can solve the problem.
-Below is the proposed devlink UAPI example~\cite{spool}:
+Below is the proposed devlink UAPI example:
 
 The attribute supports only in switchdev mode.
-\begin{verbatim}
+\begin{Verbatim}[fontsize=\small]
 $ devlink dev eswitch set pci/0000:08:00.0 \
    mode switchdev spool enable
 $ devlink dev eswitch show pci/0000:08:00.0
@@ -663,7 +657,7 @@ $ devlink dev eswitch show pci/0000:08:00.0
    spool enable
 $ devlink dev eswitch set pci/0000:08:00.0 \
    mode switchdev spool disable
-\end{verbatim}
+\end{Verbatim}
 
 With this, existing drivers will need to consider supporting both
 modes, shared RXQ mode or dedicated mode. (Or return -ENOSUPP).
