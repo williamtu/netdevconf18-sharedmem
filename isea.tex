@@ -532,16 +532,18 @@ spp = shared_pp_create(
     max_num_devs, page_pool_size, …);
 
 # Return a user id for registerd user
-spp_uid1 = shared_pp_join(spp, netdev-rep1,
+spp_uid1 = shared_pp_join(spp, rep1,
     qid, threshold);
-spp_uid2 = shared_pp_join(spp, netdev-rep2,
+spp_uid2 = shared_pp_join(spp, rep2,
     qid, threshold);
+    
 # Representor NAPI processes packets and
 # refills, and bounded by max_usage, return
 # -ENOMEM if overflow
 shared_pp_dev_alloc_page(spp, spp_uid1);
 shared_pp_dev_alloc_page(spp, spp_uid2);
 shared_pp_put_page(spp, spp_uid1);
+
 #Leave the share page pool
 shared_pp_leave(spp, spp_uid1); 
 \end{verbatim}
@@ -586,20 +588,39 @@ might still cause unfairness or some representors get no page.
 The paper~\cite{queuelength} is based on simulation, and we don't have a good
 tool or benchmark traffic pattern to measure the effectiveness of the design.
 
+Note that existing Linux page pool requires registering a DMA device to do
+dma map and unmap, and because representors all share the same DMA device,
+so they can share single page pool. Other use cases are non-physical device
+such as Linux veth/tun/tap.
+
 \subsection{D. Shared RXQ with Hardware meters}
 \begin{figure}[t!]
-\includegraphics[width=3.2in]{meter.pdf}
+\includegraphics[width=3in]{meter.pdf}
 \centering
-\caption{The adjustable RXQ from multiple reprs requests pages from the shared page pool.
-A fairness layer guarantees each repr gets the proportional shares of the total available memory.}
+\caption{The design uses hardware meter in steering to rate-limit each repr's traffic,
+so the RXQ buffers won't be monopolized by a particular vport/repr.}
 \label{fig:shared_page_pool}
 \end{figure}
 
 Another approach to solve the fairness and memory issue is to seek for hardware
 support. This design is based on A. Shared RXQ of PF, and enforces the fairness
 \emph{before} packets arriving the RXQ buffer.
+Most of the NICs supports hardware metering, which allows users to configure it
+as a rate limiter, either in PPS (packets-per-second) or BPS (bytes-per-seconds).
+Before traffic arrives and consumes the RXQ's buffer, the meter rate limiter
+might pass the packet to continue using the shared RXQ of PF, or, the meter
+rate limiter might drop the packet if a particular flow of a vport is over
+its rate.
 
-As shown in Figure~\ref{fig:meter}, the 
+\textbf{Pros and Cons:} We implemented this design and realize a couple issues.
+First, not all NIC hardware support meters. The implementation is vendor-specific
+and comes with different limitations. Second, setting the right meter rate is hard.
+Users usually have no prior knowledge
+about how fast the DPU/CPU can process the slow path traffic, either in terms of
+PPS or BPS. Setting tool low under utilizes the RXQs and setting rate too high
+causes fairness issue.
+Finally, maintaining thousands of steering rules with meters is not easy, as the
+steering rules might collide with other rules with different priorities.
 
 \begin{table}[h!]
 \centering
