@@ -491,9 +491,10 @@ and drain the RX queue back to the low\_watermark.
 We implement this prototype and evaluate its impact in performance evaluation section.
 
 \begin{figure}[t!]
-\includegraphics[width=2.8in]{shared_page_pool.pdf}
+\includegraphics[width=3.2in]{shared_page_pool.pdf}
 \centering
-\caption{The adjustable RX queues with shared page pool allows multiple}
+\caption{The adjustable RXQ from multiple reprs requests pages from the shared page pool.
+A fairness layer guarantees each repr gets the proportional shares of the total available memory.}
 \label{fig:shared_page_pool}
 \end{figure}
 
@@ -517,12 +518,14 @@ total available memory in the pool.
 Figure~\ref{fig:shared_page_pool} shows the idea.
 Assume N representor netdevs, with each has one RXQ. In the beginning,
 a special netdev, PF or uplink representor, creates the shared page pool,
-and join itself into the pool. The rest of netdevs created later join the shared page pool,
-by registering itself to the pool, call the alloc and free API to
-get or put the page into shared pool. We assume \emph{no lock} is required,
-by creating the shared page pool per-CPU NAPI context, which NAPI scheduler
-will guarantee not scheduling two NAPIs poll sharing the same pool on
-different cores. We define the following APIs:
+and joins itself into the pool. The rest of netdevs created later join the shared page pool,
+by registering itself to the pool, and requests RXQ buffers by calling
+the alloc and free API to get or put the page into shared pool.
+%We assume \emph{no lock} is required,
+%by creating the shared page pool per-CPU NAPI context, which NAPI scheduler
+%will guarantee not scheduling two NAPIs poll sharing the same pool on
+%different cores.
+We define the following APIs:
 \begin{verbatim}
 # Creates page pool, return the handler
 spp = shared_pp_create(
@@ -543,40 +546,60 @@ shared_pp_put_page(spp, spp_uid1);
 shared_pp_leave(spp, spp_uid1); 
 \end{verbatim}
 
-The problem of multiple RX queue sharing a single page pool is
+But how to solve the fairness issue?
+The problem of multiple RXQs sharing a single page pool is
 very similar to the shared memory for multiple ports problem in
-hardware switch~\cite{}, configured using devlink-sb~\cite{devlinksb}.
+hardware switch~\cite{queuelength}, configured using devlink-sb~\cite{devlinksb}.
 Instead of hardware switch memory, here we have shared page pool memory,
 and in contract to switch output ports competing for shared buffers,
-here it's the rxq from different representor devices.
+here it's the RXQs from different representor netdevs.
 Given the similarity, we re-use the dynamic threshold formula to define
-the max number of rxq buffers assigned for each RX queue. That is,
-The max\_usage of a particular shared page pool user is
+the max number of RXQ buffers assigned for each RXQ. That is,
+the max\_usage of a particular shared page pool user is
 defined by a to\_alpha value below:
+
 \begin{equation}
 \alpha = 2^{(\text{to\_alpha} - 10)}
 \end{equation}
-The to\_alpha is ranged between 0 to 20, and with $\alpha$, we can get
+and the to\_alpha is ranged between 0 to 20, and with $\alpha$, we can get
 max\_usage below:
 \begin{equation}
 \text{max\_usage} = \frac{\alpha}{1 + \alpha} \times \text{Free\_Buffer}
 \end{equation}
 
-Note that the Free Buffer means the currently available free pages
+Note that the Free\_Buffer means the currently available free pages
 in the shared page pool. As a result, each user of the pool have a
-dynamic max\_usage based on currently memory utilization.
+dynamic max\_usage based on currently page pool memory utilization.
 
 For example, assuming to\_alpha value is 11, so $\alpha = 2$, $ \text{max\_usage}
 = 1/2 * \text{Free\_buffer} $.
 This mean at any given point of time, a representor netdev can use up to half of
 the shared memory pool, even if there is no other users. An as more and more
-users join, the Free\_buffer decreases, but with each driver frees up memory
-after processing packet, the Free\_buffer will increase again.
+users join the shared page pool, the Free\_buffer decreases, but with each driver
+frees up memory after processing packets, the Free\_buffer will increase again.
 
-\subsection{C. Shared RXQ with Hardware meters}
+\textbf{Pros and Cons:} The design is simple but leaves the user to configure
+the value of $\alpha$. When the traffic distribution to different representors
+is uneven, a large $\alpha$ will limit the high volume representor to use all
+the available memory, while a smaller $\alpha$ value with a even traffic distribution
+might still cause unfairness or some representors get no page.
+The paper~\cite{queuelength} is based on simulation, and we don't have a good
+tool or benchmark traffic pattern to measure the effectiveness of the design.
+
+\subsection{D. Shared RXQ with Hardware meters}
+\begin{figure}[t!]
+\includegraphics[width=3.2in]{meter.pdf}
+\centering
+\caption{The adjustable RXQ from multiple reprs requests pages from the shared page pool.
+A fairness layer guarantees each repr gets the proportional shares of the total available memory.}
+\label{fig:shared_page_pool}
+\end{figure}
+
 Another approach to solve the fairness and memory issue is to seek for hardware
-support. This design uses the shared page pool for multiple representor netdevs,
-but instead of changing 
+support. This design is based on A. Shared RXQ of PF, and enforces the fairness
+\emph{before} packets arriving the RXQ buffer.
+
+As shown in Figure~\ref{fig:meter}, the 
 
 \begin{table}[h!]
 \centering
@@ -587,7 +610,7 @@ Nvidia MLX5 & Shared RXQ of PF and \newline Adjustable RXQ \\ \hline
 Intel ICE & Shared RXQ of PF~\cite{icepatch} \\ \hline
 Broadcom BNXT & Shared RXQ of PF ~\cite{survey} \\ \hline
 Netronome NFP & Shared RXQ of PF~\cite{survey} \\ \hline
-Solarflare SFC &  Shared RXQ of PF~\cite{survey} \\ \hline
+Solarflare SFC & Shared RXQ of PF~\cite{survey} \\ \hline
 Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
 \end{tabular}
 \caption{Summary of existing network drivers and its representor solution.}
@@ -599,7 +622,6 @@ Most of the network device drivers with representor chooses the shared
 RX Queue design, which saves memory at the price of possible
 fairness limitation. Table~\ref{tab:vendors} show a summary of 
 
-We 
 \subsection{New Devlink Eswitch Attribte: spool}
 Given the fairness issue, we'd like to propose a new devlink eswitch attribute
 for users to enable or disable the Shared RXQ of PF.
