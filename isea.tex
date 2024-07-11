@@ -46,8 +46,8 @@
 \usepackage[numbers]{natbib}
 \pdfinfo{
 /Title (Shared Memory Pool for Representors)
-/Author (Netdev Conference 0x18, 2024)}
-
+/Author (Netdev Conference 0x18, 2024)
+}
 % The file isea.sty is the style file for ISEA 2015 proceedings.
 
 % reference: epoll paper: Busy Polling: Past, Present, Future
@@ -55,8 +55,6 @@
 % reference: ./Documentation/networking/representors.rst
 % old slides about eswitch
 % https://www.netdevconf.info/1.2/slides/oct6/04_gerlitz_efraim_introduction_to_switchdev_sriov_offloads.pdf
-% ICE has limit of 1k hw queues so must share
-% 
 
 % TODO: motivation for Intel: not enough hardware queue, max 1K
 % mellanox does not have this limitation
@@ -66,6 +64,7 @@
 Nvidia and Intel\\
 witu@nvidia.com, michal.swiatkowski@intel.com, yossiku@nvidia.com\\
 \newline
+NetDev 0x18, CA, USA, July 15th-19th, 2024
 \newline
 }
 \setcounter{secnumdepth}{0}
@@ -77,24 +76,23 @@ witu@nvidia.com, michal.swiatkowski@intel.com, yossiku@nvidia.com\\
 
 \begin{abstract}
 Representor is a special object that controls the slow path of
-switchdev virtual port (the representee). 
+switchdev virtual port, or vport (the representee). 
 %It configures administratively of the virtual port, as well as provides the slow path for traffic which does not hit any offloaded fast-path rules in the switchdev.
 When scaling to thousands of vports, a corresponding thousands of
 representor netdevs are created, usually one vport has one representor
-netdev. With modern NICs containing advanced offload capabilities
+netdev. With modern NICs equipped with advanced offload capabilities
 and increasing flow tale size, the representor netdevs usually
-processes the first couple of packets
-from a new connection, and insert into the NIC hardware for
-subsequent packets to hit fast-path rules.
+processes only the first couple of packets
+from a new connection, and insert rules into the NIC hardware so
+subsequent packets are processed in hardware.
 
-Creating thousands of representor netdevs becomes resource heavy for
-just handling the connection and offload setup, especially for SmartNICs or
-DPUs (Data Processing Unit). An Nvidia Bluefield-2 contains 16GB
-of memory, but creating one thousand representor netdevs can use
-more than 10GB of RX memory buffer.
-Existing solutions save memory by sharing the RXQs of a PF netdev among
+Creating thousands of representor netdevs becomes resource heavy,
+especially for SmartNICs or DPUs (Data Processing Unit).
+An Nvidia Bluefield-2 contains 16GB of memory, but creating one
+thousand representor netdevs can use more than 10GB of RX memory buffer.
+Existing solutions save memory by sharing the RXQs of a PF (Physical Function) among
 all other reprensetors. However, this approach suffers from unfairness:
-a single VM can easily monopolize all RXQs of PF, causing no RX buffers
+a single VM can easily monopolize all RXQs, causing no RX buffers
 available for other VMs.
 The paper proposes a design with adjustable RXQ depth using a shared page pool.
 Our result shows that we can save 50\% of memory with less than 10\% of
@@ -116,89 +114,97 @@ capabilities, called switchdev mode. In switchdev mode, users can
 create multiple virtual ports, or vports, through sysfs and assign
 vports to virtual machines or containers. The switchdev mode includes
 PFs, the Primary Functions of a PCIe device, with full access to the device's
-capabilities. PFs can manage multiple types of vports, including
+capabilities. PFs manages multiple types of vports, including
 VFs (Virtual Functions) and SFs (Sub/Scalable Functions).
-The switchdev design follows the split model: a fast-path and
-slow-path.
 
-As shown in Figure~\ref{fig:arch}, a NIC with advanced offload capability
-and flow table rules is
-the fast-path, while a corresponding software switch that handles
+As shown in Figure~\ref{fig:arch}, the switchdev design follows the
+split model: a fast-path and slow-path.
+A NIC with advanced offload capabilities and flow table rules is
+the fast-path, while the corresponding software switch that handles
 initial flow rule setup, or the miss traffic processing, is considered the
 slow-path. Different vendors such as Nvidia Connect-X or Intel ICE
 supports different offload capabilities, but they follow similar
-software slow-path design, with OVS or Linux bridge attached with
-the slow-path representors, running either on host CPUs or
-SmartNIC/DPU ARM cores.
+software slow-path design. Depending on the hardware, the slow-path can
+either runs on host CPUs, or SmartNIC ARM cores, with either OVS or
+Linux bridge handling the traffic.
 
 The slow-path ports that handles miss traffic is called representor
-netdevs, registered as a regular Linux Ethernet device and is responsible
+netdevs, or repr, registered as a regular Linux Ethernet device and is responsible
 for administratively configurations of the fast-path vports.
 In typical use cases, representor netdev and its representee, vport,
 are 1-to-1 mapping: a VF/SF has a its own netdev for fast-path traffic
 in host, and another representor netdev for slow-path traffic in DPU.
-Such a design is reasonable with tens or hundred-ish vports but when scaling
-to thousands of VFs or SFs, the memory resource becomes a limiting factor.
-For example, assuming each RX queue has 1024 entries, and each entry
-pointing to a 4K-sized page. Assume the netdev has 4 RX queues (controlled
-by ethtool -L combined), a netdev will consume 4 * 4K * 1024 = 16MB.
+Such a design is reasonable with tens or hundreds of vports, but when scaling
+to thousands of VFs/SFs, the memory resource becomes a bottleneck.
+For example, assuming each representor's RXQ has 1024 entries, and each entry
+pointing to a 4K-sized page. Assume the representor netdev has 4 RXQs,
+such a netdev will consume 4 * 4K * 1024 = 16MB.
 With 1k representor netdevs, the memory consumption can grow
-to 16GB (16MB * 1024). We found that majority of memory comes from
-the RX memory buffers~\cite{jakub}, i.e., the pre-allocation of
-RX queues that handles burst of incoming traffic.
+to 16GB (16MB * 1024), just for RXQs and its buffers.
+In fact, although a netdev consumes memory other than its RXQs,
+we found that majority of memory comes from pre-allocation
+of RXQ buffers~\cite{jakub}, which is used to handle the burst of incoming traffic.
 
 % explain what's rx buffer
-The pre-allocation of RX queues and buffers are configured by Linux
+The pre-allocation of RXQs and buffers are configured by Linux
 ethtool -G/-L option, with different vendors setting different default
-value. Nvidia MLX5, by default, pre-allocates 1024 entries in each of
-its RX queues, with each entry pointing to a MTU-sized buffer or a page
-(without striding RQ). For Intel ICE, its depth RX queue depth is 2045.
-A trivial solution is to reduce the number of RX queue entries of
-representor netdevs, for example, from 1024/2048 to 64 (the minimum of NAPI
+value. Nvidia MLX5, by default, pre-allocates 1024 entries/depth in each of
+its RXQs, with each entry pointing to a MTU-sized buffer or a page
+(without striding RQ). For Intel ICE, its default RX queue depth is 2048.
+We first explore a trivial memory saving solution: Reducing the number
+of RXQ depth of representor netdevs, from 1024/2048 to 64 (the minimum of NAPI
 budget). Although this saves memory but a burst of traffic over 64 packets
-will be dropped, causing longer connection offload setup time.
+will be dropped, causing longer connection offload setup time and
+performance degradation.
 
-The paper describes the current solutions and proposed a new design.
-One solution is, instead of having one representor netdev per SF or VF,
+Instead of having one representor netdev per SF/VF, resulting in
+huge memory consumption, one solution deployed today is to 
 redirect all the slow-path traffic from all VFs/SFs to a single netdev,
-usually PF or uplink representor. As a result, the PF's RX queue receives
-all slow-path traffic from all other representors. In other word, all representors
-share the same RX queue memory pool provided by PF. The idea of using PF's
-RX qeueu as a shared memory pool is currently used by Intel ICE, Netronome,
-Broadcom bnxt, and SFC~\cite{survey}, we called this design "shared RXQ of PF".
+usually PF or uplink representor netdev. In this design, the PF's RXQs receive
+all slow-path traffic from all other representors and all representors
+share the same set of RXQs memory pool provided by PF.
+This shared RXQ of PF design saves memory because the non-PF representors
+no longer allocate their own RXQs and is used currently used by Intel ICE,
+Netronome, Broadcom bnxt, and SFC~\cite{survey} drivers.
 
-%And this saves lots of memory because slow-path traffic is redirected to
-%PF, representors no longer needs to create its own RX queues and buffers.
-We are able to create 1K SFs and 1K representor netdevs using shared RXQ
-of PF. Although this design saves lots of memory, without large and real traffic experiment, it's hard to measure the performance impact of the shared RXQ
-of PF design versus no shared design.
-In addition, we found that, a VM using a VF/SF can easily monopolize the
-entire PF's RXQ, making another VM with VF/SF zero bandwidth.
-For example, a VM
-running dpdk-testpmd to send 8Mpps of UDP traffic can easily use the
-entire PF's RXQ, causing all the rest of VM starvation.
+With shared RXQ, we are able to create 1K SFs and 1K representor netdevs
+within our memory budget. However, it's hard to measure the performance
+impact and apply QoS for each individual representors since all traffic
+are mixed together in the same RXQs. For example, to prioritize a critical
+VM's traffic which comes into the shared RXQ becomes impossible.
+Moreover, we found that, a VM using a VF/SF can easily monopolize the
+entire shared RXQs by sending high volume traffic,
+making all other VMs with VF/SF getting zero bandwidth.
+We called this a fairness problem caused by shared RXQs.
 
-The situation is similar to buffer management problem in shared-memory
-packet switches, where the hardware switch has a shared memory buffer pool
-for all its output ports and it guarantees both the performance and
-fairness~\cite{devlinksb, queuelength} among all output ports.
+%For example, a VM
+%running dpdk-testpmd to send 8Mpps of UDP traffic can easily use the
+%entire PF's RXQ, causing all the rest of VM starvation.
+
+We propose a solution called adjustable RXQ with shared page pool.
+We first save memory by dynamically reduce the RXQ depth of the
+device drivers, and then manage all the RXQ buffers in a shared
+page pool. To provide fairness, we borrow the idea from buffer management
+problem in shared-memory packet switches, where the hardware switch
+has a shared memory buffer pool for all its output ports and it
+guarantees both the performance and fairness~\cite{devlinksb, queuelength}.
+
 %The solution couldn't apply to
 %our case because it's slow-path traffic, all the hardware traffic
 %control or QoS features are not available.
-Our proposed solution is inspired by it, but implement it in software.
-We describe background in later section, three different designs,
-solution to the fairness problem, and finally some performance
-number. The paper has the following contributions:
+%Our proposed solution is inspired by it, but implement it in software.
+We describe background, discuss different designs, solutions to the fairness
+problem, and finally some performance number. The paper has the following contributions:
 \begin{itemize}
-    \item Present the memory consumption requirements for scaling to
-          thousands of devices.
+    %\item Present the memory consumption requirements for scaling to
+    %      thousands of devices.
     \item Describe the existing solutions from different driver vendors,
-          using shared RXQ provided by PF.
-    \item Propose a solution to save memory per RX queue by dynamically
-          fill and reclaim pages.
-    \item Propose a solution using a shared page pool for all netdevs,
+          with or without using shared RXQ deisgn.
+    \item Propose adjustable RXQ design to save memory with minimal performance impact.
+    \item Propose a software-based shared page pool for all netdevs,
           with inherent fairness mechanism.
 \end{itemize}
+The paper is based on recent Linux kernel, 6.9.0, which might evolve in the future.
 We welcome anyone to review and correct any content in any format (PR, or email to us)\footnote{source: https://github.com/williamtu/netdevconf18-sharedmem}.
 
 \begin{figure}[t!]
@@ -258,8 +264,8 @@ flow table lookup from the VFs/SFs.
 \includegraphics[width=1.5in]{pipe.pdf}
 \centering
 \caption{The vport (representee) and representor: packets transmitted by the representor 
-netdev are delivered to its vport; packets transmitted by the vport are
-received by the representor netdev, if it fails to match any offload rule.}
+netdev are delivered to its vport (right); packets transmitted by the vport are
+received by the representor netdev, if it fails to match any offload rule (left).}
 \label{fig:pipe}
 \end{figure}
 
