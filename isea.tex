@@ -48,6 +48,9 @@
 /Title (Shared Memory Pool for Representors)
 /Author (Netdev Conference 0x18, 2024)
 }
+% Boris: no-drop-rate (RFC2544)
+%  https://trex-tgn.cisco.com/trex/doc/trex_ndr_bench_doc.html
+
 % The file isea.sty is the style file for ISEA 2015 proceedings.
 
 % reference: epoll paper: Busy Polling: Past, Present, Future
@@ -70,7 +73,9 @@ NetDev 0x18, CA, USA, July 15th-19th, 2024
 \setcounter{secnumdepth}{0}
 
 % due deligent https://lore.kernel.org/netdev/39dbf7f6-76e0-4319-97d8-24b54e788435@nvidia.com/
-%
+% todo
+% why shaping doesn't work: packet tx buffer for shaping
+% per-packet processing costs are not constant
 \begin{document} 
 \maketitle
 
@@ -168,7 +173,7 @@ usually PF or uplink representor netdev. In this design, the PF's RXQs receive
 all slow-path traffic from all other representors and all representors
 share the same set of RXQs memory pool provided by PF.
 This shared RXQ of PF design saves memory because the non-PF representors
-no longer allocate their own RXQs and is used currently used by Intel ICE,
+no longer allocate their own RXQs. The design is used currently used by Intel ICE,
 Netronome, Broadcom bnxt, and SFC~\cite{survey} drivers.
 
 With shared RXQ, we are able to create 1K SFs and 1K representor netdevs
@@ -191,7 +196,8 @@ device drivers, and then manage all the RXQ buffers in a shared
 page pool. To provide fairness, we borrow the idea from buffer management
 problem in shared-memory packet switches, where the hardware switch
 has a shared memory buffer pool for all its output ports and it
-guarantees both the performance and fairness~\cite{devlinksb, queuelength}.
+guarantees both the performance and fairness~\cite{devlinksb, queuelength},
+using a mechanism called dynamic threshold.
 
 %The solution couldn't apply to
 %our case because it's slow-path traffic, all the hardware traffic
@@ -297,7 +303,8 @@ and flow rules are in NIC's flow table, the TCP data stream will be
 going through the fast-path in NIC, and OVS in DPU no longer involves
 in subsequent packet processing.
 
-Note that the behavior of the slow-path (representor ports and software
+Note that the slow-path is a software fall-back for the fast-path.
+The behaviors applied on packets of the slow-path (representor ports and software
 switch) should be the same as fast-path (vports and switchdev).
 And because representor and vport are acting like pipe, a network policy
 rule such as OpenFlow on a representor netdev applies to a packet on its
@@ -780,7 +787,7 @@ Table~\ref{tab:ab2} shows the results.
 \textbf{1024} & 24.2  & 65   & 41.2 & 2 & 2   \\ \hline
 \textbf{2048} & 23.9  & 95   & 41.7 & 2 & 1.8 \\ \hline
 \end{tabular}
-\caption{Result of Apache ab benchmark with 1 million requests and 100 concurrent connections.}
+\caption{Result of Apache ab benchmark with 1 million requests and 100 concurrent connections, using dynamic adjustable RXQ.}
 \label{tab:ab2}
 \end{table}
 
@@ -818,10 +825,19 @@ environment when hardware offload is always enabled.
 \label{tab:iperf}
 \end{table}
 
-%\section{Discussions}
+\subsection{Stress Test with DPDK}
+\subsection{RFC2544: Non-Drop-Rate}
+%https://trex-tgn.cisco.com/trex/doc/trex_ndr_bench_doc.html#_running_example
+
+\section{Discussions and Future Work}
+There are many ideas we are planning to try.
+Spinning CPU to save RXQ buffers
+DIM (Dynamic Interrupt Mediation) 
 %\textbf{Lock in shared page pool}:\newline
 %\textbf{Data set to evaluate fairness}:\newline
 %\textbf{A model for slow-path}:
+Shared page pool for virtual devices
+
 \section{Related Work}
 Setting the right buffer size is important for network performance.
 The paper~\cite{buffersize} provides a guideline for buffer sizing
@@ -831,11 +847,17 @@ called Dynamic Threshold (DT) for shared-memory packet switches.
 Although both papers are designed for hardware switches/routers,
 we found similarities in the case of host networking with switchdev.
 The buffer sizing, or sizing the RXQ depth, is more complicated in host
-network as the packet processing time varies a lot due to CPU workload,
+network as the per-packet processing time varies a lot due to CPU workload,
 interrupt delivery/moderation, and vendor driver implementation.
 However, the solution space in host networking is more flexible as
 ideas can be implemented in software in stead of hardware.
 
+The problem PicNIC~\cite{picnic} tried to solve is similar, however this
+work focuses on performance isolation breakage caused by the slow-path
+design. Applying back-pressure or shaping at switchdev vport is difficult
+as we only want to apply on slow-path traffic, but the shaping rule will
+be applied on both slow-path and fast-path traffic. The early drops solution
+is possible using hardware meter, as discussed in the design session.
 
 \section{Conclusion}
 Scaling to thousands of vports with their representor netdevs is challenging,
