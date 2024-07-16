@@ -784,8 +784,8 @@ Table~\ref{tab:ab2} shows the results.
 \textbf{} & \textbf{Time to complete (sec)} & \textbf{out of buffers (K)} & \textbf{Requests / sec (K)} & \textbf{Conn Time (ms)} & \textbf{Conn Time SD} \\ \hline \hline
 \textbf{256}  & 24.6  & 22   & 40.1 & 2 & 9.6 \\ \hline
 \textbf{512}  & 24.1  & 2.1  & 41.3 & 2 & 2.9 \\ \hline
-\textbf{1024} & 24.2  & 65   & 41.2 & 2 & 2   \\ \hline
-\textbf{2048} & 23.9  & 95   & 41.7 & 2 & 1.8 \\ \hline
+\textbf{1024} & 24.2  & 0.95   & 41.2 & 2 & 2   \\ \hline
+\textbf{2048} & 23.9  & 0.65   & 41.7 & 2 & 1.8 \\ \hline
 \end{tabular}
 \caption{Result of Apache ab benchmark with 1 million requests and 100 concurrent connections, using dynamic adjustable RXQ.}
 \label{tab:ab2}
@@ -838,6 +838,7 @@ DIM (Dynamic Interrupt Mediation)
 %\textbf{A model for slow-path}:
 Shared page pool for virtual devices
 
+
 \section{Related Work}
 Setting the right buffer size is important for network performance.
 The paper~\cite{buffersize} provides a guideline for buffer sizing
@@ -858,6 +859,11 @@ design. Applying back-pressure or shaping at switchdev vport is difficult
 as we only want to apply on slow-path traffic, but the shaping rule will
 be applied on both slow-path and fast-path traffic. The early drops solution
 is possible using hardware meter, as discussed in the design session.
+
+ShRing~\cite{shring}, unlike this work, shares Rx buffers between cores and
+not only within cores. Junction~\cite{junction}, similarly to this work,
+shares Rx buffers to reduce memory use. But, in contrast to this work,
+Junction uses a single coordinator core to repost Rx buffers.
 
 \section{Conclusion}
 Scaling to thousands of vports with their representor netdevs is challenging,
