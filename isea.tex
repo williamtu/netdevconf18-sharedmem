@@ -68,7 +68,6 @@ Nvidia and Intel\\
 witu@nvidia.com, michal.swiatkowski@intel.com, yossiku@nvidia.com\\
 \newline
 NetDev 0x18, CA, USA, July 15th-19th, 2024
-\newline
 }
 \setcounter{secnumdepth}{0}
 
@@ -376,7 +375,7 @@ how many hardware RX queues it can create. For example, Intel ICE can create up 
 1k queues. If users want to use more than 1k representors, there is not
 enough queues to assign to each representor netdev.
 
-\subsection{B. Shared RXQ of PF}
+\subsection{B. Shared RXQs}
 
 \begin{figure}[t!]
 \includegraphics[width=2in]{design1.pdf}
@@ -635,12 +634,13 @@ steering rules might collide with other rules with different priorities.
 \footnotesize
 \begin{tabular}{|l|p{3.6cm}|} \hline
 \textbf{Driver} &  \textbf{Implementation}\\ \hline \hline
-Nvidia MLX5 & Shared RXQ of PF and \newline Adjustable RXQ \\ \hline
-Intel ICE & Shared RXQ of PF~\cite{icepatch} \\ \hline
-Broadcom BNXT & Shared RXQ of PF ~\cite{survey} \\ \hline
-Netronome NFP & Shared RXQ of PF~\cite{survey} \\ \hline
-Solarflare SFC & Shared RXQ of PF~\cite{survey} \\ \hline
-Marvell Octeontx2 & Dedicated repr netdevs~\cite{octeontx2} \\ \hline
+Nvidia MLX5 & Dedicated RXQ\\ \hline
+Intel ICE & Shared RXQs~\cite{icepatch} \\ \hline
+Intel ICE (before~\cite{icepatch} & Dedicated RXQ \\ \hline
+Broadcom BNXT & Shared RXQs~\cite{survey} \\ \hline
+Netronome NFP & Shared RXQs~\cite{survey} \\ \hline
+Solarflare SFC & Shared RXQs~\cite{survey} \\ \hline
+Marvell Octeontx2 & Dedicated RXQ~\cite{octeontx2} \\ \hline
 \end{tabular}
 \caption{Summary of existing network drivers and its representor solution.}
 \label{tab:vendors}
@@ -654,27 +654,33 @@ network device driver's implementation choices.
 For MLX5 driver, we'd like to propose a configuration knobs that turns
 on or off the Shared RXQ, depending on users' choice.
 
-\subsection{New Devlink Eswitch Attribte: spool}
+\subsection{New Devlink Eswitch Attribte: spool-mode}
 Given the fairness issue, we'd like to propose a new devlink eswitch attribute
-for users to enable or disable the Shared RXQ of PF.
-When memory is a precious resource such as SmartNIC or DPU, enabling the Shared RXQ
-saves the most memory as it only uses the RXQ from the PF. And the memory consumption
+for users to enable or disable the Shared RXQs.
+When memory is a precious resource such as SmartNIC or DPU, enabling the Shared RXQs
+saves the most memory as it only uses the shared RXQs. And the memory consumption
 does not grow linearly as the number of representors grows.
-On the other hand, if users worry about potential fairness issue or malicious users,
-then disabling shared RXQ and fallback to the dedicated RXQ can solve the problem.
-Below is the proposed devlink UAPI example:
+On the other hand, if users worry about potential fairness issue or need
+performance isolation, then disabling shared RXQ and fallback to the dedicated
+RXQ can solve the problem. Below is the proposed devlink, spool-mode:
 
+\begin{itemize}
+    \item none: Driver uses dedicated RXQ on its representor netdev.
+    \item basic: Driver uses shared RXQs on its representor netdevs.
+    \item spp (shared page pool): Driver uses shared page pool with adjustable RXQ depth on its representor netdevs. 
+\end{itemize}
 The attribute supports only in switchdev mode.
 \begin{Verbatim}[fontsize=\small]
 $ devlink dev eswitch set pci/0000:08:00.0 \
-   mode switchdev spool enable
+   mode switchdev spool-mode none
 $ devlink dev eswitch show pci/0000:08:00.0
    pci/0000:08:00.0: mode legacy \
    inline-mode none encap-mode basic \
-   spool enable
+   spool-mode none
 $ devlink dev eswitch set pci/0000:08:00.0 \
-   mode switchdev spool disable
+   mode switchdev spool-mode basic
 \end{Verbatim}
+
 
 With this, existing drivers will need to consider supporting both
 modes, shared RXQ mode or dedicated mode. (Or return -ENOSUPP).
@@ -825,8 +831,8 @@ environment when hardware offload is always enabled.
 \label{tab:iperf}
 \end{table}
 
-\subsection{Stress Test with DPDK}
-\subsection{RFC2544: Non-Drop-Rate}
+%\subsection{Stress Test with DPDK}
+%\subsection{RFC2544: Non-Drop-Rate}
 %https://trex-tgn.cisco.com/trex/doc/trex_ndr_bench_doc.html#_running_example
 
 \section{Discussions and Future Work}
